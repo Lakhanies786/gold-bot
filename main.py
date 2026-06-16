@@ -258,12 +258,28 @@ news_log:      list = _load_json(NEWS_LOG_FILE)
 # ══════════════════════════════════════════════════════════════════════
 # TWELVE DATA FETCHER
 # ══════════════════════════════════════════════════════════════════════
+# ── API rate-limit cache ─────────────────────────────────────────────
+# Twelve Data free tier: 8 req/min, 800 req/day
+# Cache candles per timeframe for 4 min, price for 60 sec
+# This prevents 429 errors when Android app + scanner + resolver all call at once
+_candle_cache: dict = {}   # key: (granularity, count) → (df, timestamp)
+_price_cache:  dict = {"price": None, "spread": 0.3, "ts": 0.0}
+
+CANDLE_CACHE_TTL = 240   # seconds — candles refreshed every 4 min
+PRICE_CACHE_TTL  = 60    # seconds — price refreshed every 60 sec
+
+
 def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
     """
-    Fetch XAU/USD candles from Twelve Data.
-    Function name kept as get_oanda_candles so rest of code needs no changes.
+    Fetch XAU/USD candles from Twelve Data with caching.
+    Returns cached data if last fetch was within CANDLE_CACHE_TTL seconds.
     granularity: M1, M5, M15, H1, H4, D
     """
+    cache_key = (granularity, count)
+    cached = _candle_cache.get(cache_key)
+    if cached and (time.time() - cached[1]) < CANDLE_CACHE_TTL:
+        return cached[0]
+
     interval = TF_MAP.get(granularity, "1h")
     params   = {
         "symbol":     SYMBOL,
@@ -293,26 +309,26 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     df.set_index("time", inplace=True)
+    _candle_cache[cache_key] = (df, time.time())
     return df
 
 
 def get_current_price() -> tuple:
-    """Get current XAU/USD real-time price from Twelve Data."""
-    params = {
-        "symbol": SYMBOL,
-        "apikey": TWELVE_DATA_API_KEY,
-    }
-    # Get real-time price
-    resp  = requests.get(f"{TWELVE_DATA_URL}/price", params=params, timeout=10)
+    """Get current XAU/USD price with 60-second cache to avoid 429 errors."""
+    if _price_cache["price"] is not None and             (time.time() - _price_cache["ts"]) < PRICE_CACHE_TTL:
+        return _price_cache["price"], _price_cache["spread"]
+
+    params = {"symbol": SYMBOL, "apikey": TWELVE_DATA_API_KEY}
+    resp   = requests.get(f"{TWELVE_DATA_URL}/price", params=params, timeout=10)
     resp.raise_for_status()
-    data  = resp.json()
+    data   = resp.json()
 
     if "price" not in data:
         raise ValueError(f"Twelve Data error: {data.get('message', 'No price data')}")
 
     price  = float(data["price"])
-    # Typical gold spread on Twelve Data is not available — use 0.3 pips default
     spread = 0.3
+    _price_cache.update({"price": price, "spread": spread, "ts": time.time()})
     return price, spread
 
 
