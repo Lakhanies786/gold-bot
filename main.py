@@ -2088,3 +2088,42 @@ def get_signals_log(limit: int = 50):
 @app.get("/scalp/log")
 def get_scalp_log(limit: int = 50):
     return {"signals": scalp_log[-limit:], "total": len(scalp_log)}
+
+@app.get("/signals/download")
+def download_swing_report():
+    """Download swing signal log as Excel file."""
+    df = pd.DataFrame(signal_log)
+    if df.empty:
+        df = pd.DataFrame(columns=["timestamp", "signal", "confidence", "score", "outcome", "pnl_pct", "grade", "status"])
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Swing Signals")
+    output.seek(0)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=gold_swing_{today}.xlsx"}
+    )
+
+
+@app.get("/scalp/download")
+def download_scalp_report():
+    """Download scalp signal log as Excel file."""
+    df = pd.DataFrame(scalp_log)
+    if df.empty:
+        df = pd.DataFrame(columns=["timestamp", "signal", "confidence", "score", "outcome", "pnl_pct", "grade", "status"])
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Scalp Signals")
+    output.seek(0)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=gold_scalp_{today}.xlsx"}
+    )
