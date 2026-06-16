@@ -1792,6 +1792,7 @@ def passes_scalp_filters(sig: dict) -> tuple:
 # ══════════════════════════════════════════════════════════════════════
 def _grade_stats(signals: list, grade: str) -> dict:
     bucket = [s for s in signals if s.get("grade") == grade]
+    open_  = [s for s in bucket if s.get("status") == "OPEN"]
     closed = [s for s in bucket if s.get("status") == "CLOSED"]
     wins   = [s for s in closed if s.get("outcome") == "WIN"]
     losses = [s for s in closed if s.get("outcome") == "LOSS"]
@@ -1803,6 +1804,7 @@ def _grade_stats(signals: list, grade: str) -> dict:
     return {
         "grade":      grade,
         "total":      len(bucket),
+        "open":       len(open_),
         "wins":       len(wins),
         "losses":     len(losses),
         "win_rate":   f"{win_rate}%",
