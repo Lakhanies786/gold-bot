@@ -22,15 +22,14 @@ try:
 except ImportError:
     _PG_AVAILABLE = False
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")  # Set in Railway dashboard
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 
 def _get_db():
     if not _PG_AVAILABLE or not DATABASE_URL:
         return None
     try:
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-        return conn
+        return psycopg2.connect(DATABASE_URL, connect_timeout=5)
     except Exception as e:
         print(f"[DB] Connection failed: {e}")
         return None
@@ -120,16 +119,14 @@ def _db_insert_trade(entry: dict):
         conn.close()
 
 
-def _db_close_trade(trade_id: str, outcome: str, exit_price: float,
-                    pnl_pct: float, closed_at: str, bars_held: int):
+def _db_close_trade(trade_id, outcome, exit_price, pnl_pct, closed_at, bars_held):
     conn = _get_db()
     if not conn:
         return False
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE trades
-                SET status='CLOSED', outcome=%s, exit_price=%s,
+                UPDATE trades SET status='CLOSED', outcome=%s, exit_price=%s,
                     pnl_pct=%s, closed_at=%s, bars_held=%s
                 WHERE id=%s AND status='OPEN';
             """, (outcome, exit_price, pnl_pct, closed_at, bars_held, trade_id))
@@ -142,7 +139,7 @@ def _db_close_trade(trade_id: str, outcome: str, exit_price: float,
         conn.close()
 
 
-def _db_get_open_trades() -> list:
+def _db_get_open_trades():
     conn = _get_db()
     if not conn:
         return []
@@ -157,7 +154,7 @@ def _db_get_open_trades() -> list:
         conn.close()
 
 
-def _db_get_all_trades(mode: str = None, limit: int = 500) -> list:
+def _db_get_all_trades(mode=None, limit=500):
     conn = _get_db()
     if not conn:
         return []
@@ -166,13 +163,10 @@ def _db_get_all_trades(mode: str = None, limit: int = 500) -> list:
             if mode:
                 cur.execute(
                     "SELECT * FROM trades WHERE mode=%s ORDER BY logged_at DESC LIMIT %s;",
-                    (mode, limit)
-                )
+                    (mode, limit))
             else:
                 cur.execute(
-                    "SELECT * FROM trades ORDER BY logged_at DESC LIMIT %s;",
-                    (limit,)
-                )
+                    "SELECT * FROM trades ORDER BY logged_at DESC LIMIT %s;", (limit,))
             rows = [dict(r) for r in cur.fetchall()]
             for r in rows:
                 for k, v in r.items():
@@ -184,6 +178,7 @@ def _db_get_all_trades(mode: str = None, limit: int = 500) -> list:
         return []
     finally:
         conn.close()
+
 
 app = FastAPI(title="Gold Trading Bot — XAUUSD", version="1.0.0")
 
@@ -1739,7 +1734,7 @@ def log_swing_signal(sig: dict, passed: bool, reasons: list):
     if len(signal_log) > 500:
         signal_log[:] = signal_log[-500:]
     _save_json(SIGNAL_LOG_FILE, signal_log)
-    _db_insert_trade(entry)   # ← also write to PostgreSQL
+    _db_insert_trade(entry)
 
     if not passed:
         blocked_log.append(entry)
@@ -1794,7 +1789,7 @@ def log_scalp_signal(sig: dict, passed: bool, reasons: list):
     if len(scalp_log) > 500:
         scalp_log[:] = scalp_log[-500:]
     _save_json(SCALP_LOG_FILE, scalp_log)
-    _db_insert_trade(entry)   # ← also write to PostgreSQL
+    _db_insert_trade(entry)
 
     if not passed:
         scalp_blocked.append(entry)
@@ -2264,88 +2259,136 @@ def get_signals_log(limit: int = 50):
 def get_scalp_log(limit: int = 50):
     return {"signals": scalp_log[-limit:], "total": len(scalp_log)}
 
+@app.get("/signals/download")
+def download_swing_report():
+    """Download swing signal log as Excel file."""
+    try:
+        import openpyxl  # noqa
+        COL_ORDER = [
+            "id", "mode", "date", "time_utc", "symbol", "signal", "grade",
+            "trade_allowed", "blocked_by", "confidence", "score",
+            "adx", "rsi", "vol_ratio", "spread", "session", "daily_bias", "market_regime",
+            "entry_price", "stop_loss", "take_profit", "risk_reward",
+            "nearest_support", "nearest_resistance",
+            "status", "outcome", "exit_price", "pnl_pct", "logged_at",
+        ]
+        src = _db_get_all_trades(mode="SWING") if (DATABASE_URL and _PG_AVAILABLE) else signal_log
+        if src:
+            flat = [{k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in r.items()} for r in src]
+            df = pd.DataFrame(flat)
+            ordered = [c for c in COL_ORDER if c in df.columns]
+            df = df[ordered + [c for c in df.columns if c not in COL_ORDER]]
+        else:
+            df = pd.DataFrame(columns=COL_ORDER)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Swing Signals")
+        output.seek(0)
+        today = datetime.now().strftime("%Y-%m-%d")
+        return StreamingResponse(output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=gold_swing_{today}.xlsx"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
+
+
+@app.get("/scalp/download")
+def download_scalp_report():
+    """Download scalp signal log as Excel file."""
+    try:
+        import openpyxl  # noqa
+        COL_ORDER = [
+            "id", "mode", "date", "time_utc", "symbol", "signal", "grade",
+            "trade_allowed", "blocked_by", "confidence", "score",
+            "adx", "rsi", "vol_ratio", "spread", "session",
+            "entry_price", "stop_loss", "take_profit",
+            "nearest_support", "nearest_resistance",
+            "status", "outcome", "exit_price", "pnl_pct", "logged_at",
+        ]
+        src = _db_get_all_trades(mode="SCALP") if (DATABASE_URL and _PG_AVAILABLE) else scalp_log
+        if src:
+            flat = [{k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in r.items()} for r in src]
+            df = pd.DataFrame(flat)
+            ordered = [c for c in COL_ORDER if c in df.columns]
+            df = df[ordered + [c for c in df.columns if c not in COL_ORDER]]
+        else:
+            df = pd.DataFrame(columns=COL_ORDER)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Scalp Signals")
+        output.seek(0)
+        today = datetime.now().strftime("%Y-%m-%d")
+        return StreamingResponse(output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=gold_scalp_{today}.xlsx"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
+
 # ══════════════════════════════════════════════════════════════════════
-# PAPER TRADE RESOLVER — auto-close open trades against real price
+# PAPER TRADE RESOLVER
 # ══════════════════════════════════════════════════════════════════════
 async def paper_trade_resolver():
-    """Every 5 min: check all OPEN paper trades against current price.
-    A trade closes when price hits stop_loss (LOSS) or take_profit (WIN).
-    Swing trades also expire after 48 hours. Scalp after 4 hours.
-    """
-    await asyncio.sleep(30)  # let server warm up first
+    """Every 5 min: auto-close open paper trades vs live price."""
+    await asyncio.sleep(30)
     while True:
         try:
             price, _ = get_current_price()
-            now       = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
 
-            def _resolve(log_list: list, log_file: str, max_hours: int):
+            def _resolve(log_list, log_file, max_hours):
                 changed = False
                 for trade in log_list:
                     if trade.get("status") != "OPEN":
                         continue
-                    sig        = trade.get("signal", "HOLD")
-                    entry      = trade.get("entry_price") or 0
-                    sl         = trade.get("stop_loss") or 0
-                    tp         = trade.get("take_profit") or 0
-                    logged_str = trade.get("logged_at", "")
+                    sig   = trade.get("signal", "HOLD")
+                    entry = trade.get("entry_price") or 0
+                    sl    = trade.get("stop_loss") or 0
+                    tp    = trade.get("take_profit") or 0
                     if not entry or not sl or not tp:
                         continue
-
-                    # Age check — expire old open trades
                     try:
-                        logged_dt = datetime.fromisoformat(logged_str.replace("Z", "+00:00"))
-                        age_hrs   = (now - logged_dt).total_seconds() / 3600
+                        logged_dt = datetime.fromisoformat(
+                            trade.get("logged_at", "").replace("Z", "+00:00"))
+                        age_hrs = (now - logged_dt).total_seconds() / 3600
                     except Exception:
                         age_hrs = 0
 
-                    outcome    = None
-                    exit_price = None
-
+                    outcome = exit_price = None
                     if sig == "BUY":
-                        if price <= sl:
-                            outcome, exit_price = "LOSS", sl
-                        elif price >= tp:
-                            outcome, exit_price = "WIN",  tp
+                        if price <= sl:   outcome, exit_price = "LOSS", sl
+                        elif price >= tp: outcome, exit_price = "WIN",  tp
                     elif sig == "SELL":
-                        if price >= sl:
-                            outcome, exit_price = "LOSS", sl
-                        elif price <= tp:
-                            outcome, exit_price = "WIN",  tp
+                        if price >= sl:   outcome, exit_price = "LOSS", sl
+                        elif price <= tp: outcome, exit_price = "WIN",  tp
 
-                    # Expire if held too long without hitting SL/TP
                     if outcome is None and age_hrs >= max_hours:
-                        outcome    = "EXPIRED"
-                        exit_price = price
+                        outcome, exit_price = "EXPIRED", price
 
                     if outcome:
                         pnl = 0.0
                         if entry and exit_price:
-                            if sig == "BUY":
-                                pnl = round((exit_price - entry) / entry * 100, 3)
-                            else:
-                                pnl = round((entry - exit_price) / entry * 100, 3)
-                        bars = int(age_hrs * 12)  # approx 5-min bars
-                        trade["status"]     = "CLOSED"
-                        trade["outcome"]    = outcome
-                        trade["exit_price"] = round(exit_price, 2)
-                        trade["pnl_pct"]    = pnl
-                        trade["closed_at"]  = now.isoformat()
-                        trade["bars_held"]  = bars
+                            pnl = round(
+                                ((exit_price - entry) / entry * 100) if sig == "BUY"
+                                else ((entry - exit_price) / entry * 100), 3)
+                        bars = int(age_hrs * 12)
+                        trade.update({
+                            "status": "CLOSED", "outcome": outcome,
+                            "exit_price": round(exit_price, 2),
+                            "pnl_pct": pnl, "closed_at": now.isoformat(),
+                            "bars_held": bars,
+                        })
                         _db_close_trade(trade["id"], outcome, round(exit_price, 2),
                                         pnl, now.isoformat(), bars)
                         changed = True
-                        print(f"[Resolver] {trade['id']} → {outcome} @ {exit_price:.2f}  PnL {pnl:+.3f}%")
-
+                        print(f"[Resolver] {trade['id']} -> {outcome} @ {exit_price:.2f}  PnL {pnl:+.3f}%")
                 if changed:
                     _save_json(log_file, log_list)
 
             _resolve(signal_log, SIGNAL_LOG_FILE, max_hours=48)
             _resolve(scalp_log,  SCALP_LOG_FILE,  max_hours=4)
-
         except Exception as e:
             print(f"[Resolver] Error: {e}")
-
-        await asyncio.sleep(300)  # run every 5 min
+        await asyncio.sleep(300)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2353,8 +2396,8 @@ async def paper_trade_resolver():
 # ══════════════════════════════════════════════════════════════════════
 @app.get("/paper/stats")
 def paper_stats():
-    """Full paper-trading performance breakdown — wins, losses, PnL, grade breakdown."""
-    def _analyse(trades: list, label: str) -> dict:
+    """Full paper-trading performance: win rate, PnL, expectancy, by grade/session/direction."""
+    def _analyse(trades, label):
         allowed = [t for t in trades if t.get("trade_allowed") == "YES"
                    and t.get("signal") in ("BUY", "SELL")]
         closed  = [t for t in allowed if t.get("status") == "CLOSED"]
@@ -2363,105 +2406,75 @@ def paper_stats():
         expired = [t for t in closed  if t.get("outcome") == "EXPIRED"]
         open_   = [t for t in allowed if t.get("status") == "OPEN"]
         pnls    = [t["pnl_pct"] for t in closed if t.get("pnl_pct") is not None]
-
-        win_rate   = round(len(wins) / max(len(wins) + len(losses), 1) * 100, 1)
-        total_pnl  = round(sum(pnls), 3) if pnls else 0
-        avg_pnl    = round(sum(pnls) / len(pnls), 3) if pnls else 0
-        avg_win    = round(sum(t["pnl_pct"] for t in wins)   / max(len(wins),   1), 3)
-        avg_loss   = round(sum(t["pnl_pct"] for t in losses) / max(len(losses), 1), 3)
-        expectancy = round((win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss), 3)
-
-        # Grade breakdown
+        wr    = round(len(wins) / max(len(wins) + len(losses), 1) * 100, 1)
+        avg_w = round(sum(t["pnl_pct"] for t in wins)   / max(len(wins),   1), 3)
+        avg_l = round(sum(t["pnl_pct"] for t in losses) / max(len(losses), 1), 3)
         grade_rows = {}
         for g in ("A", "B", "C"):
-            g_closed = [t for t in closed if t.get("grade") == g]
-            g_wins   = [t for t in g_closed if t.get("outcome") == "WIN"]
-            g_losses = [t for t in g_closed if t.get("outcome") == "LOSS"]
-            g_pnls   = [t["pnl_pct"] for t in g_closed if t.get("pnl_pct") is not None]
+            gc = [t for t in closed if t.get("grade") == g]
+            gw = [t for t in gc if t.get("outcome") == "WIN"]
+            gl = [t for t in gc if t.get("outcome") == "LOSS"]
+            gp = [t["pnl_pct"] for t in gc if t.get("pnl_pct") is not None]
             grade_rows[g] = {
-                "total":    len(g_closed),
-                "wins":     len(g_wins),
-                "losses":   len(g_losses),
-                "win_rate": f"{round(len(g_wins)/max(len(g_wins)+len(g_losses),1)*100,1)}%",
-                "total_pnl": f"{round(sum(g_pnls),3):+.3f}%",
+                "total": len(gc), "wins": len(gw), "losses": len(gl),
+                "win_rate": f"{round(len(gw)/max(len(gw)+len(gl),1)*100,1)}%",
+                "total_pnl": f"{round(sum(gp),3):+.3f}%" if gp else "+0.000%",
             }
-
-        # Session breakdown
         sessions = {}
         for t in closed:
             s = t.get("session", "UNKNOWN")
             sessions.setdefault(s, {"wins": 0, "losses": 0, "pnl": 0.0})
-            if t.get("outcome") == "WIN":
-                sessions[s]["wins"] += 1
-            elif t.get("outcome") == "LOSS":
-                sessions[s]["losses"] += 1
+            if t.get("outcome") == "WIN":    sessions[s]["wins"]   += 1
+            elif t.get("outcome") == "LOSS": sessions[s]["losses"] += 1
             if t.get("pnl_pct") is not None:
                 sessions[s]["pnl"] = round(sessions[s]["pnl"] + t["pnl_pct"], 3)
-
-        # Signal direction breakdown
         buys  = [t for t in closed if t.get("signal") == "BUY"]
         sells = [t for t in closed if t.get("signal") == "SELL"]
-        buy_wins  = len([t for t in buys  if t.get("outcome") == "WIN"])
-        sell_wins = len([t for t in sells if t.get("outcome") == "WIN"])
-
+        bw = len([t for t in buys  if t.get("outcome") == "WIN"])
+        sw = len([t for t in sells if t.get("outcome") == "WIN"])
         return {
-            "mode":          label,
-            "open_trades":   len(open_),
-            "total_closed":  len(closed),
-            "wins":          len(wins),
-            "losses":        len(losses),
-            "expired":       len(expired),
-            "win_rate":      f"{win_rate}%",
-            "total_pnl":     f"{total_pnl:+.3f}%",
-            "avg_pnl_per_trade": f"{avg_pnl:+.3f}%",
-            "avg_win":       f"{avg_win:+.3f}%",
-            "avg_loss":      f"{avg_loss:+.3f}%",
-            "expectancy":    f"{expectancy:+.3f}%",
-            "by_grade":      grade_rows,
-            "by_session":    sessions,
+            "mode": label, "open_trades": len(open_),
+            "total_closed": len(closed), "wins": len(wins),
+            "losses": len(losses), "expired": len(expired),
+            "win_rate": f"{wr}%",
+            "total_pnl": f"{round(sum(pnls),3):+.3f}%" if pnls else "+0.000%",
+            "avg_pnl_per_trade": f"{round(sum(pnls)/len(pnls),3):+.3f}%" if pnls else "+0.000%",
+            "avg_win": f"{avg_w:+.3f}%", "avg_loss": f"{avg_l:+.3f}%",
+            "expectancy": f"{round((wr/100*avg_w)+((1-wr/100)*avg_l),3):+.3f}%",
+            "by_grade": grade_rows, "by_session": sessions,
             "by_direction": {
-                "BUY":  {"total": len(buys),  "wins": buy_wins,
-                         "win_rate": f"{round(buy_wins/max(len(buys),1)*100,1)}%"},
-                "SELL": {"total": len(sells), "wins": sell_wins,
-                         "win_rate": f"{round(sell_wins/max(len(sells),1)*100,1)}%"},
+                "BUY":  {"total": len(buys),  "wins": bw,
+                         "win_rate": f"{round(bw/max(len(buys),1)*100,1)}%"},
+                "SELL": {"total": len(sells), "wins": sw,
+                         "win_rate": f"{round(sw/max(len(sells),1)*100,1)}%"},
             },
         }
-
-    # Use DB if available, else fall back to in-memory JSON logs
-    if DATABASE_URL and _PG_AVAILABLE:
-        swing_trades = _db_get_all_trades(mode="SWING")
-        scalp_trades = _db_get_all_trades(mode="SCALP")
-    else:
-        swing_trades = signal_log
-        scalp_trades = scalp_log
-
+    sw = _db_get_all_trades(mode="SWING") if (DATABASE_URL and _PG_AVAILABLE) else signal_log
+    sc = _db_get_all_trades(mode="SCALP") if (DATABASE_URL and _PG_AVAILABLE) else scalp_log
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "swing":        _analyse(swing_trades, "SWING"),
-        "scalp":        _analyse(scalp_trades, "SCALP"),
+        "swing": _analyse(sw, "SWING"),
+        "scalp": _analyse(sc, "SCALP"),
     }
 
 
 @app.get("/paper/trades")
 def paper_trades(mode: str = None, status: str = None, limit: int = 100):
-    """List paper trades. Optional filters: mode=SWING|SCALP, status=OPEN|CLOSED."""
+    """List paper trades. Filters: mode=SWING|SCALP, status=OPEN|CLOSED."""
     if DATABASE_URL and _PG_AVAILABLE:
         trades = _db_get_all_trades(mode=mode.upper() if mode else None, limit=limit)
     else:
         trades = signal_log + scalp_log
         if mode:
-            trades = [t for t in trades if t.get("mode", "").upper() == mode.upper()]
-
+            trades = [t for t in trades if t.get("mode","").upper() == mode.upper()]
     if status:
-        trades = [t for t in trades if t.get("status", "").upper() == status.upper()]
-
-    trades = trades[:limit]
-    return {"total": len(trades), "trades": trades}
+        trades = [t for t in trades if t.get("status","").upper() == status.upper()]
+    return {"total": len(trades[:limit]), "trades": trades[:limit]}
 
 
 @app.get("/paper/open")
 def paper_open_trades():
-    """List all currently open paper trades."""
+    """All currently open paper trades."""
     if DATABASE_URL and _PG_AVAILABLE:
         open_trades = _db_get_open_trades()
     else:
@@ -2471,164 +2484,52 @@ def paper_open_trades():
 
 @app.get("/paper/download")
 def paper_download():
-    """Download ALL paper trades (swing + scalp) as a single Excel file with analysis sheet."""
+    """Download ALL paper trades as Excel with Summary, Swing, and Scalp sheets."""
     try:
         import openpyxl  # noqa
-
-        if DATABASE_URL and _PG_AVAILABLE:
-            all_trades = _db_get_all_trades(limit=5000)
-        else:
-            all_trades = signal_log + scalp_log
-
-        COL_ORDER = [
+        all_trades = (_db_get_all_trades(limit=5000)
+                      if (DATABASE_URL and _PG_AVAILABLE)
+                      else signal_log + scalp_log)
+        COL = [
             "id", "mode", "date", "time_utc", "signal", "grade", "trade_allowed",
             "blocked_by", "confidence", "score", "adx", "rsi", "vol_ratio",
             "session", "daily_bias", "market_regime",
             "entry_price", "stop_loss", "take_profit", "risk_reward",
             "status", "outcome", "exit_price", "pnl_pct", "bars_held", "logged_at",
         ]
-
-        def _to_df(trades):
-            if not trades:
-                return pd.DataFrame(columns=COL_ORDER)
-            flat = []
-            for row in trades:
-                flat.append({k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
-                             for k, v in row.items()})
+        def _to_df(rows):
+            if not rows:
+                return pd.DataFrame(columns=COL)
+            flat = [{k: (json.dumps(v) if isinstance(v,(dict,list)) else v)
+                     for k, v in r.items()} for r in rows]
             df = pd.DataFrame(flat)
-            ordered = [c for c in COL_ORDER if c in df.columns]
-            extra   = [c for c in df.columns if c not in COL_ORDER]
-            return df[ordered + extra]
-
+            ordered = [c for c in COL if c in df.columns]
+            return df[ordered + [c for c in df.columns if c not in COL]]
         swing_df = _to_df([t for t in all_trades if t.get("mode") == "SWING"])
         scalp_df = _to_df([t for t in all_trades if t.get("mode") == "SCALP"])
-
-        # Build summary sheet
-        stats    = paper_stats()
-        rows     = []
-        for mode_key in ("swing", "scalp"):
-            s = stats[mode_key]
-            rows.append({"Metric": f"[{mode_key.upper()}] Win Rate",      "Value": s["win_rate"]})
-            rows.append({"Metric": f"[{mode_key.upper()}] Total PnL",     "Value": s["total_pnl"]})
-            rows.append({"Metric": f"[{mode_key.upper()}] Avg PnL/Trade", "Value": s["avg_pnl_per_trade"]})
-            rows.append({"Metric": f"[{mode_key.upper()}] Expectancy",    "Value": s["expectancy"]})
-            rows.append({"Metric": f"[{mode_key.upper()}] Wins",          "Value": s["wins"]})
-            rows.append({"Metric": f"[{mode_key.upper()}] Losses",        "Value": s["losses"]})
-            rows.append({"Metric": f"[{mode_key.upper()}] Open Trades",   "Value": s["open_trades"]})
-            for g in ("A", "B", "C"):
-                gd = s["by_grade"][g]
-                rows.append({"Metric": f"[{mode_key.upper()}] Grade {g} Win Rate", "Value": gd["win_rate"]})
-        summary_df = pd.DataFrame(rows)
-
+        stats = paper_stats()
+        summary_rows = []
+        for mk in ("swing", "scalp"):
+            s = stats[mk]
+            for label, val in [
+                ("Win Rate", s["win_rate"]), ("Total PnL", s["total_pnl"]),
+                ("Avg PnL/Trade", s["avg_pnl_per_trade"]), ("Expectancy", s["expectancy"]),
+                ("Wins", s["wins"]), ("Losses", s["losses"]),
+                ("Expired", s["expired"]), ("Open Trades", s["open_trades"]),
+                ("Grade A Win Rate", s["by_grade"]["A"]["win_rate"]),
+                ("Grade B Win Rate", s["by_grade"]["B"]["win_rate"]),
+                ("Grade C Win Rate", s["by_grade"]["C"]["win_rate"]),
+            ]:
+                summary_rows.append({"Metric": f"[{mk.upper()}] {label}", "Value": val})
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            summary_df.to_excel(writer, index=False, sheet_name="📊 Summary")
-            swing_df.to_excel(writer,   index=False, sheet_name="Swing Trades")
-            scalp_df.to_excel(writer,   index=False, sheet_name="Scalp Trades")
+            pd.DataFrame(summary_rows).to_excel(writer, index=False, sheet_name="Summary")
+            swing_df.to_excel(writer, index=False, sheet_name="Swing Trades")
+            scalp_df.to_excel(writer, index=False, sheet_name="Scalp Trades")
         output.seek(0)
-
         today = datetime.now().strftime("%Y-%m-%d")
-        return StreamingResponse(
-            output,
+        return StreamingResponse(output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename=gold_paper_{today}.xlsx"},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
-
-
-@app.get("/signals/download")
-def download_swing_report():
-    """Download swing signal log as Excel file."""
-    try:
-        import openpyxl  # noqa: F401 — ensure installed
-
-        DEFAULT_COLS = [
-            "id", "mode", "date", "time_utc", "symbol", "signal", "grade",
-            "trade_allowed", "blocked_by", "confidence", "score",
-            "adx", "rsi", "vol_ratio", "spread", "session", "daily_bias",
-            "market_regime", "entry_price", "stop_loss", "take_profit",
-            "risk_reward", "nearest_support", "nearest_resistance",
-            "status", "outcome", "exit_price", "pnl_pct", "logged_at",
-        ]
-
-        if signal_log:
-            # Flatten: convert any nested dict/list values to strings so
-            # openpyxl never chokes on non-scalar cell values
-            flat_rows = []
-            for row in signal_log:
-                flat_row = {}
-                for k, v in row.items():
-                    if isinstance(v, (dict, list)):
-                        flat_row[k] = json.dumps(v)
-                    else:
-                        flat_row[k] = v
-                flat_rows.append(flat_row)
-            df = pd.DataFrame(flat_rows)
-            # Keep only known columns that exist, preserve order
-            ordered = [c for c in DEFAULT_COLS if c in df.columns]
-            extra   = [c for c in df.columns if c not in DEFAULT_COLS]
-            df = df[ordered + extra]
-        else:
-            df = pd.DataFrame(columns=DEFAULT_COLS)
-
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Swing Signals")
-        output.seek(0)
-
-        today = datetime.now().strftime("%Y-%m-%d")
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename=gold_swing_{today}.xlsx"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
-
-
-@app.get("/scalp/download")
-def download_scalp_report():
-    """Download scalp signal log as Excel file."""
-    try:
-        import openpyxl  # noqa: F401 — ensure installed
-
-        DEFAULT_COLS = [
-            "id", "mode", "date", "time_utc", "symbol", "signal", "grade",
-            "trade_allowed", "blocked_by", "confidence", "score",
-            "adx", "rsi", "vol_ratio", "spread", "session",
-            "entry_price", "stop_loss", "take_profit",
-            "nearest_support", "nearest_resistance",
-            "status", "outcome", "exit_price", "pnl_pct", "logged_at",
-        ]
-
-        if scalp_log:
-            flat_rows = []
-            for row in scalp_log:
-                flat_row = {}
-                for k, v in row.items():
-                    if isinstance(v, (dict, list)):
-                        flat_row[k] = json.dumps(v)
-                    else:
-                        flat_row[k] = v
-                flat_rows.append(flat_row)
-            df = pd.DataFrame(flat_rows)
-            ordered = [c for c in DEFAULT_COLS if c in df.columns]
-            extra   = [c for c in df.columns if c not in DEFAULT_COLS]
-            df = df[ordered + extra]
-        else:
-            df = pd.DataFrame(columns=DEFAULT_COLS)
-
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Scalp Signals")
-        output.seek(0)
-
-        today = datetime.now().strftime("%Y-%m-%d")
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename=gold_scalp_{today}.xlsx"}
-        )
+            headers={"Content-Disposition": f"attachment; filename=gold_paper_{today}.xlsx"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
