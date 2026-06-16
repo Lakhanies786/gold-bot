@@ -2092,38 +2092,95 @@ def get_scalp_log(limit: int = 50):
 @app.get("/signals/download")
 def download_swing_report():
     """Download swing signal log as Excel file."""
-    df = pd.DataFrame(signal_log)
-    if df.empty:
-        df = pd.DataFrame(columns=["timestamp", "signal", "confidence", "score", "outcome", "pnl_pct", "grade", "status"])
+    try:
+        import openpyxl  # noqa: F401 — ensure installed
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Swing Signals")
-    output.seek(0)
+        DEFAULT_COLS = [
+            "id", "mode", "date", "time_utc", "symbol", "signal", "grade",
+            "trade_allowed", "blocked_by", "confidence", "score",
+            "adx", "rsi", "vol_ratio", "spread", "session", "daily_bias",
+            "market_regime", "entry_price", "stop_loss", "take_profit",
+            "risk_reward", "nearest_support", "nearest_resistance",
+            "status", "outcome", "exit_price", "pnl_pct", "logged_at",
+        ]
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=gold_swing_{today}.xlsx"}
-    )
+        if signal_log:
+            # Flatten: convert any nested dict/list values to strings so
+            # openpyxl never chokes on non-scalar cell values
+            flat_rows = []
+            for row in signal_log:
+                flat_row = {}
+                for k, v in row.items():
+                    if isinstance(v, (dict, list)):
+                        flat_row[k] = json.dumps(v)
+                    else:
+                        flat_row[k] = v
+                flat_rows.append(flat_row)
+            df = pd.DataFrame(flat_rows)
+            # Keep only known columns that exist, preserve order
+            ordered = [c for c in DEFAULT_COLS if c in df.columns]
+            extra   = [c for c in df.columns if c not in DEFAULT_COLS]
+            df = df[ordered + extra]
+        else:
+            df = pd.DataFrame(columns=DEFAULT_COLS)
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Swing Signals")
+        output.seek(0)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=gold_swing_{today}.xlsx"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
 
 
 @app.get("/scalp/download")
 def download_scalp_report():
     """Download scalp signal log as Excel file."""
-    df = pd.DataFrame(scalp_log)
-    if df.empty:
-        df = pd.DataFrame(columns=["timestamp", "signal", "confidence", "score", "outcome", "pnl_pct", "grade", "status"])
+    try:
+        import openpyxl  # noqa: F401 — ensure installed
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Scalp Signals")
-    output.seek(0)
+        DEFAULT_COLS = [
+            "id", "mode", "date", "time_utc", "symbol", "signal", "grade",
+            "trade_allowed", "blocked_by", "confidence", "score",
+            "adx", "rsi", "vol_ratio", "spread", "session",
+            "entry_price", "stop_loss", "take_profit",
+            "nearest_support", "nearest_resistance",
+            "status", "outcome", "exit_price", "pnl_pct", "logged_at",
+        ]
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=gold_scalp_{today}.xlsx"}
-    )
+        if scalp_log:
+            flat_rows = []
+            for row in scalp_log:
+                flat_row = {}
+                for k, v in row.items():
+                    if isinstance(v, (dict, list)):
+                        flat_row[k] = json.dumps(v)
+                    else:
+                        flat_row[k] = v
+                flat_rows.append(flat_row)
+            df = pd.DataFrame(flat_rows)
+            ordered = [c for c in DEFAULT_COLS if c in df.columns]
+            extra   = [c for c in df.columns if c not in DEFAULT_COLS]
+            df = df[ordered + extra]
+        else:
+            df = pd.DataFrame(columns=DEFAULT_COLS)
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Scalp Signals")
+        output.seek(0)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=gold_scalp_{today}.xlsx"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
