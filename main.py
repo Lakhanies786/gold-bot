@@ -14,6 +14,177 @@ import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
+# ── PostgreSQL (optional — falls back to JSON if DATABASE_URL not set) ─
+try:
+    import psycopg2
+    import psycopg2.extras
+    _PG_AVAILABLE = True
+except ImportError:
+    _PG_AVAILABLE = False
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")  # Set in Railway dashboard
+
+
+def _get_db():
+    if not _PG_AVAILABLE or not DATABASE_URL:
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        return conn
+    except Exception as e:
+        print(f"[DB] Connection failed: {e}")
+        return None
+
+
+def _init_db():
+    conn = _get_db()
+    if not conn:
+        print("[DB] No DATABASE_URL — using JSON file storage")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id                 TEXT PRIMARY KEY,
+                    mode               TEXT,
+                    logged_at          TIMESTAMPTZ,
+                    date               TEXT,
+                    time_utc           TEXT,
+                    symbol             TEXT,
+                    signal             TEXT,
+                    grade              TEXT,
+                    trade_allowed      TEXT,
+                    blocked_by         TEXT,
+                    confidence         TEXT,
+                    score              TEXT,
+                    adx                REAL,
+                    rsi                REAL,
+                    vol_ratio          REAL,
+                    spread             REAL,
+                    session            TEXT,
+                    daily_bias         TEXT,
+                    market_regime      TEXT,
+                    entry_price        REAL,
+                    stop_loss          REAL,
+                    take_profit        REAL,
+                    risk_reward        TEXT,
+                    nearest_support    REAL,
+                    nearest_resistance REAL,
+                    status             TEXT DEFAULT 'OPEN',
+                    outcome            TEXT DEFAULT '-',
+                    exit_price         REAL,
+                    pnl_pct            REAL,
+                    closed_at          TIMESTAMPTZ,
+                    bars_held          INTEGER
+                );
+            """)
+            conn.commit()
+        print("[DB] Tables ready ✅")
+    except Exception as e:
+        print(f"[DB] Init error: {e}")
+    finally:
+        conn.close()
+
+
+def _db_insert_trade(entry: dict):
+    conn = _get_db()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO trades (
+                    id, mode, logged_at, date, time_utc, symbol, signal, grade,
+                    trade_allowed, blocked_by, confidence, score, adx, rsi,
+                    vol_ratio, spread, session, daily_bias, market_regime,
+                    entry_price, stop_loss, take_profit, risk_reward,
+                    nearest_support, nearest_resistance,
+                    status, outcome, exit_price, pnl_pct
+                ) VALUES (
+                    %(id)s, %(mode)s, %(logged_at)s, %(date)s, %(time_utc)s,
+                    %(symbol)s, %(signal)s, %(grade)s, %(trade_allowed)s,
+                    %(blocked_by)s, %(confidence)s, %(score)s, %(adx)s, %(rsi)s,
+                    %(vol_ratio)s, %(spread)s, %(session)s, %(daily_bias)s,
+                    %(market_regime)s, %(entry_price)s, %(stop_loss)s,
+                    %(take_profit)s, %(risk_reward)s, %(nearest_support)s,
+                    %(nearest_resistance)s, %(status)s, %(outcome)s,
+                    %(exit_price)s, %(pnl_pct)s
+                ) ON CONFLICT (id) DO NOTHING;
+            """, {**entry, "logged_at": entry.get("logged_at")})
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Insert error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _db_close_trade(trade_id: str, outcome: str, exit_price: float,
+                    pnl_pct: float, closed_at: str, bars_held: int):
+    conn = _get_db()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE trades
+                SET status='CLOSED', outcome=%s, exit_price=%s,
+                    pnl_pct=%s, closed_at=%s, bars_held=%s
+                WHERE id=%s AND status='OPEN';
+            """, (outcome, exit_price, pnl_pct, closed_at, bars_held, trade_id))
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Update error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _db_get_open_trades() -> list:
+    conn = _get_db()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY logged_at;")
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[DB] Fetch error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _db_get_all_trades(mode: str = None, limit: int = 500) -> list:
+    conn = _get_db()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if mode:
+                cur.execute(
+                    "SELECT * FROM trades WHERE mode=%s ORDER BY logged_at DESC LIMIT %s;",
+                    (mode, limit)
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM trades ORDER BY logged_at DESC LIMIT %s;",
+                    (limit,)
+                )
+            rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                for k, v in r.items():
+                    if hasattr(v, "isoformat"):
+                        r[k] = v.isoformat()
+            return rows
+    except Exception as e:
+        print(f"[DB] Fetch error: {e}")
+        return []
+    finally:
+        conn.close()
+
 app = FastAPI(title="Gold Trading Bot — XAUUSD", version="1.0.0")
 
 # ── Log file paths — absolute, never reset on redeploy ───────────────
@@ -1568,6 +1739,7 @@ def log_swing_signal(sig: dict, passed: bool, reasons: list):
     if len(signal_log) > 500:
         signal_log[:] = signal_log[-500:]
     _save_json(SIGNAL_LOG_FILE, signal_log)
+    _db_insert_trade(entry)   # ← also write to PostgreSQL
 
     if not passed:
         blocked_log.append(entry)
@@ -1622,6 +1794,7 @@ def log_scalp_signal(sig: dict, passed: bool, reasons: list):
     if len(scalp_log) > 500:
         scalp_log[:] = scalp_log[-500:]
     _save_json(SCALP_LOG_FILE, scalp_log)
+    _db_insert_trade(entry)   # ← also write to PostgreSQL
 
     if not passed:
         scalp_blocked.append(entry)
@@ -1817,7 +1990,9 @@ def _grade_stats(signals: list, grade: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup_event():
+    _init_db()
     asyncio.create_task(background_scanner())
+    asyncio.create_task(paper_trade_resolver())
 
 
 async def background_scanner():
@@ -2088,6 +2263,279 @@ def get_signals_log(limit: int = 50):
 @app.get("/scalp/log")
 def get_scalp_log(limit: int = 50):
     return {"signals": scalp_log[-limit:], "total": len(scalp_log)}
+
+# ══════════════════════════════════════════════════════════════════════
+# PAPER TRADE RESOLVER — auto-close open trades against real price
+# ══════════════════════════════════════════════════════════════════════
+async def paper_trade_resolver():
+    """Every 5 min: check all OPEN paper trades against current price.
+    A trade closes when price hits stop_loss (LOSS) or take_profit (WIN).
+    Swing trades also expire after 48 hours. Scalp after 4 hours.
+    """
+    await asyncio.sleep(30)  # let server warm up first
+    while True:
+        try:
+            price, _ = get_current_price()
+            now       = datetime.now(timezone.utc)
+
+            def _resolve(log_list: list, log_file: str, max_hours: int):
+                changed = False
+                for trade in log_list:
+                    if trade.get("status") != "OPEN":
+                        continue
+                    sig        = trade.get("signal", "HOLD")
+                    entry      = trade.get("entry_price") or 0
+                    sl         = trade.get("stop_loss") or 0
+                    tp         = trade.get("take_profit") or 0
+                    logged_str = trade.get("logged_at", "")
+                    if not entry or not sl or not tp:
+                        continue
+
+                    # Age check — expire old open trades
+                    try:
+                        logged_dt = datetime.fromisoformat(logged_str.replace("Z", "+00:00"))
+                        age_hrs   = (now - logged_dt).total_seconds() / 3600
+                    except Exception:
+                        age_hrs = 0
+
+                    outcome    = None
+                    exit_price = None
+
+                    if sig == "BUY":
+                        if price <= sl:
+                            outcome, exit_price = "LOSS", sl
+                        elif price >= tp:
+                            outcome, exit_price = "WIN",  tp
+                    elif sig == "SELL":
+                        if price >= sl:
+                            outcome, exit_price = "LOSS", sl
+                        elif price <= tp:
+                            outcome, exit_price = "WIN",  tp
+
+                    # Expire if held too long without hitting SL/TP
+                    if outcome is None and age_hrs >= max_hours:
+                        outcome    = "EXPIRED"
+                        exit_price = price
+
+                    if outcome:
+                        pnl = 0.0
+                        if entry and exit_price:
+                            if sig == "BUY":
+                                pnl = round((exit_price - entry) / entry * 100, 3)
+                            else:
+                                pnl = round((entry - exit_price) / entry * 100, 3)
+                        bars = int(age_hrs * 12)  # approx 5-min bars
+                        trade["status"]     = "CLOSED"
+                        trade["outcome"]    = outcome
+                        trade["exit_price"] = round(exit_price, 2)
+                        trade["pnl_pct"]    = pnl
+                        trade["closed_at"]  = now.isoformat()
+                        trade["bars_held"]  = bars
+                        _db_close_trade(trade["id"], outcome, round(exit_price, 2),
+                                        pnl, now.isoformat(), bars)
+                        changed = True
+                        print(f"[Resolver] {trade['id']} → {outcome} @ {exit_price:.2f}  PnL {pnl:+.3f}%")
+
+                if changed:
+                    _save_json(log_file, log_list)
+
+            _resolve(signal_log, SIGNAL_LOG_FILE, max_hours=48)
+            _resolve(scalp_log,  SCALP_LOG_FILE,  max_hours=4)
+
+        except Exception as e:
+            print(f"[Resolver] Error: {e}")
+
+        await asyncio.sleep(300)  # run every 5 min
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PAPER TRADING ANALYSIS ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════
+@app.get("/paper/stats")
+def paper_stats():
+    """Full paper-trading performance breakdown — wins, losses, PnL, grade breakdown."""
+    def _analyse(trades: list, label: str) -> dict:
+        allowed = [t for t in trades if t.get("trade_allowed") == "YES"
+                   and t.get("signal") in ("BUY", "SELL")]
+        closed  = [t for t in allowed if t.get("status") == "CLOSED"]
+        wins    = [t for t in closed  if t.get("outcome") == "WIN"]
+        losses  = [t for t in closed  if t.get("outcome") == "LOSS"]
+        expired = [t for t in closed  if t.get("outcome") == "EXPIRED"]
+        open_   = [t for t in allowed if t.get("status") == "OPEN"]
+        pnls    = [t["pnl_pct"] for t in closed if t.get("pnl_pct") is not None]
+
+        win_rate   = round(len(wins) / max(len(wins) + len(losses), 1) * 100, 1)
+        total_pnl  = round(sum(pnls), 3) if pnls else 0
+        avg_pnl    = round(sum(pnls) / len(pnls), 3) if pnls else 0
+        avg_win    = round(sum(t["pnl_pct"] for t in wins)   / max(len(wins),   1), 3)
+        avg_loss   = round(sum(t["pnl_pct"] for t in losses) / max(len(losses), 1), 3)
+        expectancy = round((win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss), 3)
+
+        # Grade breakdown
+        grade_rows = {}
+        for g in ("A", "B", "C"):
+            g_closed = [t for t in closed if t.get("grade") == g]
+            g_wins   = [t for t in g_closed if t.get("outcome") == "WIN"]
+            g_losses = [t for t in g_closed if t.get("outcome") == "LOSS"]
+            g_pnls   = [t["pnl_pct"] for t in g_closed if t.get("pnl_pct") is not None]
+            grade_rows[g] = {
+                "total":    len(g_closed),
+                "wins":     len(g_wins),
+                "losses":   len(g_losses),
+                "win_rate": f"{round(len(g_wins)/max(len(g_wins)+len(g_losses),1)*100,1)}%",
+                "total_pnl": f"{round(sum(g_pnls),3):+.3f}%",
+            }
+
+        # Session breakdown
+        sessions = {}
+        for t in closed:
+            s = t.get("session", "UNKNOWN")
+            sessions.setdefault(s, {"wins": 0, "losses": 0, "pnl": 0.0})
+            if t.get("outcome") == "WIN":
+                sessions[s]["wins"] += 1
+            elif t.get("outcome") == "LOSS":
+                sessions[s]["losses"] += 1
+            if t.get("pnl_pct") is not None:
+                sessions[s]["pnl"] = round(sessions[s]["pnl"] + t["pnl_pct"], 3)
+
+        # Signal direction breakdown
+        buys  = [t for t in closed if t.get("signal") == "BUY"]
+        sells = [t for t in closed if t.get("signal") == "SELL"]
+        buy_wins  = len([t for t in buys  if t.get("outcome") == "WIN"])
+        sell_wins = len([t for t in sells if t.get("outcome") == "WIN"])
+
+        return {
+            "mode":          label,
+            "open_trades":   len(open_),
+            "total_closed":  len(closed),
+            "wins":          len(wins),
+            "losses":        len(losses),
+            "expired":       len(expired),
+            "win_rate":      f"{win_rate}%",
+            "total_pnl":     f"{total_pnl:+.3f}%",
+            "avg_pnl_per_trade": f"{avg_pnl:+.3f}%",
+            "avg_win":       f"{avg_win:+.3f}%",
+            "avg_loss":      f"{avg_loss:+.3f}%",
+            "expectancy":    f"{expectancy:+.3f}%",
+            "by_grade":      grade_rows,
+            "by_session":    sessions,
+            "by_direction": {
+                "BUY":  {"total": len(buys),  "wins": buy_wins,
+                         "win_rate": f"{round(buy_wins/max(len(buys),1)*100,1)}%"},
+                "SELL": {"total": len(sells), "wins": sell_wins,
+                         "win_rate": f"{round(sell_wins/max(len(sells),1)*100,1)}%"},
+            },
+        }
+
+    # Use DB if available, else fall back to in-memory JSON logs
+    if DATABASE_URL and _PG_AVAILABLE:
+        swing_trades = _db_get_all_trades(mode="SWING")
+        scalp_trades = _db_get_all_trades(mode="SCALP")
+    else:
+        swing_trades = signal_log
+        scalp_trades = scalp_log
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "swing":        _analyse(swing_trades, "SWING"),
+        "scalp":        _analyse(scalp_trades, "SCALP"),
+    }
+
+
+@app.get("/paper/trades")
+def paper_trades(mode: str = None, status: str = None, limit: int = 100):
+    """List paper trades. Optional filters: mode=SWING|SCALP, status=OPEN|CLOSED."""
+    if DATABASE_URL and _PG_AVAILABLE:
+        trades = _db_get_all_trades(mode=mode.upper() if mode else None, limit=limit)
+    else:
+        trades = signal_log + scalp_log
+        if mode:
+            trades = [t for t in trades if t.get("mode", "").upper() == mode.upper()]
+
+    if status:
+        trades = [t for t in trades if t.get("status", "").upper() == status.upper()]
+
+    trades = trades[:limit]
+    return {"total": len(trades), "trades": trades}
+
+
+@app.get("/paper/open")
+def paper_open_trades():
+    """List all currently open paper trades."""
+    if DATABASE_URL and _PG_AVAILABLE:
+        open_trades = _db_get_open_trades()
+    else:
+        open_trades = [t for t in signal_log + scalp_log if t.get("status") == "OPEN"]
+    return {"total": len(open_trades), "trades": open_trades}
+
+
+@app.get("/paper/download")
+def paper_download():
+    """Download ALL paper trades (swing + scalp) as a single Excel file with analysis sheet."""
+    try:
+        import openpyxl  # noqa
+
+        if DATABASE_URL and _PG_AVAILABLE:
+            all_trades = _db_get_all_trades(limit=5000)
+        else:
+            all_trades = signal_log + scalp_log
+
+        COL_ORDER = [
+            "id", "mode", "date", "time_utc", "signal", "grade", "trade_allowed",
+            "blocked_by", "confidence", "score", "adx", "rsi", "vol_ratio",
+            "session", "daily_bias", "market_regime",
+            "entry_price", "stop_loss", "take_profit", "risk_reward",
+            "status", "outcome", "exit_price", "pnl_pct", "bars_held", "logged_at",
+        ]
+
+        def _to_df(trades):
+            if not trades:
+                return pd.DataFrame(columns=COL_ORDER)
+            flat = []
+            for row in trades:
+                flat.append({k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
+                             for k, v in row.items()})
+            df = pd.DataFrame(flat)
+            ordered = [c for c in COL_ORDER if c in df.columns]
+            extra   = [c for c in df.columns if c not in COL_ORDER]
+            return df[ordered + extra]
+
+        swing_df = _to_df([t for t in all_trades if t.get("mode") == "SWING"])
+        scalp_df = _to_df([t for t in all_trades if t.get("mode") == "SCALP"])
+
+        # Build summary sheet
+        stats    = paper_stats()
+        rows     = []
+        for mode_key in ("swing", "scalp"):
+            s = stats[mode_key]
+            rows.append({"Metric": f"[{mode_key.upper()}] Win Rate",      "Value": s["win_rate"]})
+            rows.append({"Metric": f"[{mode_key.upper()}] Total PnL",     "Value": s["total_pnl"]})
+            rows.append({"Metric": f"[{mode_key.upper()}] Avg PnL/Trade", "Value": s["avg_pnl_per_trade"]})
+            rows.append({"Metric": f"[{mode_key.upper()}] Expectancy",    "Value": s["expectancy"]})
+            rows.append({"Metric": f"[{mode_key.upper()}] Wins",          "Value": s["wins"]})
+            rows.append({"Metric": f"[{mode_key.upper()}] Losses",        "Value": s["losses"]})
+            rows.append({"Metric": f"[{mode_key.upper()}] Open Trades",   "Value": s["open_trades"]})
+            for g in ("A", "B", "C"):
+                gd = s["by_grade"][g]
+                rows.append({"Metric": f"[{mode_key.upper()}] Grade {g} Win Rate", "Value": gd["win_rate"]})
+        summary_df = pd.DataFrame(rows)
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            summary_df.to_excel(writer, index=False, sheet_name="📊 Summary")
+            swing_df.to_excel(writer,   index=False, sheet_name="Swing Trades")
+            scalp_df.to_excel(writer,   index=False, sheet_name="Scalp Trades")
+        output.seek(0)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=gold_paper_{today}.xlsx"},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Excel generation failed: {e}")
+
 
 @app.get("/signals/download")
 def download_swing_report():
