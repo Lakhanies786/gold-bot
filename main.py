@@ -260,13 +260,13 @@ news_log:      list = _load_json(NEWS_LOG_FILE)
 # ══════════════════════════════════════════════════════════════════════
 # ── API rate-limit cache ─────────────────────────────────────────────
 # Twelve Data free tier: 8 req/min, 800 req/day
-# Cache candles per timeframe for 4 min, price for 60 sec
-# This prevents 429 errors when Android app + scanner + resolver all call at once
+# Price is derived from the M1 candle close — no separate /price API call needed
+# This halves daily quota usage and makes the app resilient to rate limits
 _candle_cache: dict = {}   # key: (granularity, count) → (df, timestamp)
 _price_cache:  dict = {"price": None, "spread": 0.3, "ts": 0.0}
 
-CANDLE_CACHE_TTL = 240   # seconds — candles refreshed every 4 min
-PRICE_CACHE_TTL  = 60    # seconds — price refreshed every 60 sec
+CANDLE_CACHE_TTL = 300   # seconds — candles refreshed every 5 min
+PRICE_CACHE_TTL  = 300   # seconds — price refreshed every 5 min (from M1 candle)
 
 
 def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
@@ -290,6 +290,12 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
         "order":      "ASC",
     }
     resp = requests.get(f"{TWELVE_DATA_URL}/time_series", params=params, timeout=15)
+    if resp.status_code == 429:
+        # Rate limited — return stale cache if available rather than crashing
+        if cached:
+            print(f"[Candles] 429 rate limit for {granularity} — returning stale cache")
+            return cached[0]
+        raise ValueError("Rate limited by Twelve Data. Wait 1 minute and retry.")
     resp.raise_for_status()
     data = resp.json()
 
@@ -314,22 +320,62 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
 
 
 def get_current_price() -> tuple:
-    """Get current XAU/USD price with 60-second cache to avoid 429 errors."""
+    """Get current XAU/USD price.
+
+    Strategy to stay within free tier limits:
+    1. Return cache if fresh (within PRICE_CACHE_TTL)
+    2. Try to derive price from already-cached M1 candles (free — no API call)
+    3. Only call /price API if no candle cache exists yet
+    4. If API returns 429, return last known price rather than crashing
+    """
+    # 1. Return cache if still fresh
     if _price_cache["price"] is not None and             (time.time() - _price_cache["ts"]) < PRICE_CACHE_TTL:
         return _price_cache["price"], _price_cache["spread"]
 
-    params = {"symbol": SYMBOL, "apikey": TWELVE_DATA_API_KEY}
-    resp   = requests.get(f"{TWELVE_DATA_URL}/price", params=params, timeout=10)
-    resp.raise_for_status()
-    data   = resp.json()
+    # 2. Derive from M1 candle cache if available (costs 0 API calls)
+    m1_cached = _candle_cache.get(("M1", 100))
+    if m1_cached and (time.time() - m1_cached[1]) < CANDLE_CACHE_TTL:
+        try:
+            price = float(m1_cached[0]["close"].iloc[-1])
+            _price_cache.update({"price": price, "spread": 0.3, "ts": time.time()})
+            return price, 0.3
+        except Exception:
+            pass
 
-    if "price" not in data:
-        raise ValueError(f"Twelve Data error: {data.get('message', 'No price data')}")
+    # 3. Try M15 candle cache as fallback
+    m15_cached = _candle_cache.get(("M15", 200))
+    if m15_cached and (time.time() - m15_cached[1]) < CANDLE_CACHE_TTL:
+        try:
+            price = float(m15_cached[0]["close"].iloc[-1])
+            _price_cache.update({"price": price, "spread": 0.3, "ts": time.time()})
+            return price, 0.3
+        except Exception:
+            pass
 
-    price  = float(data["price"])
-    spread = 0.3
-    _price_cache.update({"price": price, "spread": spread, "ts": time.time()})
-    return price, spread
+    # 4. Call the API — but handle 429 gracefully
+    try:
+        params = {"symbol": SYMBOL, "apikey": TWELVE_DATA_API_KEY}
+        resp   = requests.get(f"{TWELVE_DATA_URL}/price", params=params, timeout=10)
+        if resp.status_code == 429:
+            # Rate limited — return last known price if we have one
+            if _price_cache["price"] is not None:
+                print("[Price] 429 rate limit — returning cached price")
+                return _price_cache["price"], _price_cache["spread"]
+            raise ValueError("Rate limited by Twelve Data and no cached price available. "
+                             "Wait a minute and try again.")
+        resp.raise_for_status()
+        data  = resp.json()
+        if "price" not in data:
+            raise ValueError(f"Twelve Data error: {data.get('message', 'No price data')}")
+        price  = float(data["price"])
+        spread = 0.3
+        _price_cache.update({"price": price, "spread": spread, "ts": time.time()})
+        return price, spread
+    except requests.exceptions.HTTPError as e:
+        if _price_cache["price"] is not None:
+            print(f"[Price] API error ({e}) — returning cached price")
+            return _price_cache["price"], _price_cache["spread"]
+        raise
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2274,6 +2320,99 @@ def get_signals_log(limit: int = 50):
 @app.get("/scalp/log")
 def get_scalp_log(limit: int = 50):
     return {"signals": scalp_log[-limit:], "total": len(scalp_log)}
+
+# ══════════════════════════════════════════════════════════════════════
+# DASHBOARD — single endpoint that replaces 5 separate Android calls
+# Android app calls this once per minute instead of 5 endpoints
+# Saves ~4 API calls per minute = ~5,760 Twelve Data calls/day saved
+# ══════════════════════════════════════════════════════════════════════
+@app.get("/dashboard")
+def get_dashboard(mode: str = "swing"):
+    """
+    Returns everything the Android app needs in one request:
+    price, signal, stats, grade-stats, news log.
+    mode: swing | scalp
+    """
+    result = {}
+
+    # 1. Price (uses cache — no extra API call if already fetched)
+    try:
+        price, spread = get_current_price()
+        session       = is_trading_session()
+        result["price"] = {
+            "instrument": "XAUUSD",
+            "price":      round(price, 2),
+            "spread":     round(spread, 1),
+            "session":    session["session"],
+            "in_session": session["in_session"],
+        }
+    except Exception as e:
+        result["price"] = {"error": str(e)}
+
+    # 2. Signal (uses candle cache — no extra API call after first fetch)
+    try:
+        if mode.lower() == "scalp":
+            result["signal"] = compute_scalp_signal()
+        else:
+            result["signal"] = compute_swing_signal()
+    except Exception as e:
+        result["signal"] = {"error": str(e), "signal": "HOLD"}
+
+    # 3. Stats
+    try:
+        log = scalp_log if mode.lower() == "scalp" else signal_log
+        directional = [s for s in log if s.get("signal") in ("BUY", "SELL")]
+        closed      = [s for s in directional if s.get("status") == "CLOSED"]
+        wins        = [s for s in closed if s.get("outcome") == "WIN"]
+        losses      = [s for s in closed if s.get("outcome") == "LOSS"]
+        pnls        = [s["pnl_pct"] for s in closed if s.get("pnl_pct") is not None]
+        win_rate    = round(len(wins) / max(len(wins) + len(losses), 1) * 100, 1)
+        result["stats"] = {
+            "wins":     len(wins),
+            "losses":   len(losses),
+            "win_rate": f"{win_rate}%",
+            "pnl":      f"{round(sum(pnls), 2):+.2f}%" if pnls else "+0.00%",
+            "open":     sum(1 for s in directional if s.get("status") == "OPEN"),
+            "total":    len(directional),
+        }
+    except Exception as e:
+        result["stats"] = {"error": str(e)}
+
+    # 4. Grade stats
+    try:
+        log = scalp_log if mode.lower() == "scalp" else signal_log
+        directional = [s for s in log if s.get("signal") in ("BUY", "SELL")]
+        result["grade_stats"] = {
+            "total_signals": len(directional),
+            "grades": {
+                "A": _grade_stats(directional, "A"),
+                "B": _grade_stats(directional, "B"),
+                "C": _grade_stats(directional, "C"),
+            }
+        }
+    except Exception as e:
+        result["grade_stats"] = {"error": str(e)}
+
+    # 5. News log (swing only)
+    try:
+        if mode.lower() == "swing":
+            result["news_log"] = {
+                "news_blocked_signals": news_log[-20:],
+                "total": len(news_log),
+                "summary": {
+                    "total_blocked":   len(news_log),
+                    "would_have_won":  sum(1 for s in news_log if s.get("would_have_won") is True),
+                    "would_have_lost": sum(1 for s in news_log if s.get("would_have_won") is False),
+                    "unresolved":      sum(1 for s in news_log if s.get("would_have_won") is None),
+                }
+            }
+    except Exception as e:
+        result["news_log"] = {"error": str(e)}
+
+    result["mode"]         = mode.lower()
+    result["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return result
+
 
 @app.get("/signals/download")
 def download_swing_report():
