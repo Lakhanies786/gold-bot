@@ -2028,17 +2028,19 @@ def _grade_stats(signals: list, grade: str) -> dict:
     losses = [s for s in closed if s.get("outcome") == "LOSS"]
     pnls   = [s["pnl_pct"] for s in closed if s.get("pnl_pct") is not None]
 
-    win_rate   = round(len(wins) / max(len(wins) + len(losses), 1) * 100, 1)
-    avg_profit = round(sum(pnls) / len(pnls), 2) if pnls else 0
+    has_closed = len(wins) + len(losses) > 0
+    win_rate   = round(len(wins) / max(len(wins) + len(losses), 1) * 100, 1) if has_closed else None
+    avg_profit = round(sum(pnls) / len(pnls), 2) if pnls else None
 
     return {
         "grade":      grade,
-        "total":      len(bucket),
-        "open":       len(open_),
+        "total":      len(bucket),      # all signals including open
+        "open":       len(open_),       # currently open
+        "closed":     len(closed),      # resolved trades
         "wins":       len(wins),
         "losses":     len(losses),
-        "win_rate":   f"{win_rate}%",
-        "avg_profit": f"{avg_profit:+.2f}%",
+        "win_rate":   f"{win_rate}%" if win_rate is not None else "--",
+        "avg_profit": f"{avg_profit:+.2f}%" if avg_profit is not None else "--",
     }
 
 
