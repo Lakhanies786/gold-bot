@@ -229,9 +229,13 @@ GRADE_B = {"min_confidence": 55, "min_score":  9, "min_adx": 20, "min_volume": 0
 
 # ── Gold Session Filter (UTC) ─────────────────────────────────────────
 # Gold moves best during London and New York sessions
+# Gold forex sessions (UTC) — covers full 22:00 Sun – 21:00 Fri market
 SESSIONS = [
-    (7, 12),   # London: 07:00–12:00 UTC
-    (12, 17),  # New York: 12:00–17:00 UTC
+    (0,  8,  "ASIA"),       # Hong Kong / Tokyo
+    (7,  12, "LONDON"),     # London morning
+    (12, 16, "OVERLAP"),    # London/NY overlap — highest volume
+    (16, 21, "NEW_YORK"),   # New York afternoon
+    (22, 24, "ASIA_OPEN"),  # Sydney/Asia open
 ]
 
 # ── In-memory logs ────────────────────────────────────────────────────
@@ -1216,21 +1220,34 @@ def check_gold_news() -> dict:
 
 
 def is_trading_session() -> dict:
-    """Check if current time is within gold trading sessions."""
+    """Check if current time is within gold trading sessions.
+    Gold forex trades 22:00 Sun – 21:00 Fri UTC.
+    Only closed: 21:00–22:00 UTC daily gap, and full weekend.
+    """
     now_utc = datetime.now(timezone.utc)
     hour    = now_utc.hour
     weekday = now_utc.weekday()  # 0=Mon, 6=Sun
 
-    # Gold market closed weekends
-    if weekday >= 5:
+    # Saturday — fully closed
+    if weekday == 5:
         return {"in_session": False, "session": "WEEKEND", "hour_utc": hour}
+    # Sunday before 22:00 UTC — closed
+    if weekday == 6 and hour < 22:
+        return {"in_session": False, "session": "WEEKEND", "hour_utc": hour}
+    # Friday after 21:00 UTC — market closing
+    if weekday == 4 and hour >= 21:
+        return {"in_session": False, "session": "MARKET_CLOSE", "hour_utc": hour}
+    # Daily close gap 21:00–22:00 UTC Mon–Thu
+    if hour == 21:
+        return {"in_session": False, "session": "DAILY_CLOSE", "hour_utc": hour}
 
-    for start, end in SESSIONS:
+    # Find named session — SESSIONS is list of (start, end, name)
+    for start, end, name in SESSIONS:
         if start <= hour < end:
-            name = "LONDON" if end == 12 else "NEW_YORK" if start == 12 else "OVERLAP"
             return {"in_session": True, "session": name, "hour_utc": hour}
 
-    return {"in_session": False, "session": "OFF_HOURS", "hour_utc": hour}
+    # Fallback — should rarely hit
+    return {"in_session": True, "session": "OPEN", "hour_utc": hour}
 
 
 def generate_gold_signal(df_1h: pd.DataFrame, df_4h: pd.DataFrame,
