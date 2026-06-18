@@ -322,58 +322,68 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
 def get_current_price() -> tuple:
     """Get current XAU/USD price.
 
-    Strategy to stay within free tier limits:
-    1. Return cache if fresh (within PRICE_CACHE_TTL)
-    2. Try to derive price from already-cached M1 candles (free — no API call)
-    3. Only call /price API if no candle cache exists yet
-    4. If API returns 429, return last known price rather than crashing
+    Priority:
+    1. Cache if fresh (< 60s)
+    2. Fresh M1 candle close (< 90s old) — free, no API call
+    3. Fresh M15 candle close (< 120s old) — free
+    4. Twelve Data /price API call
+    5. Stale cache if < 3 min old (on 429)
+    6. Error if cache > 3 min old — prevents stuck price display
     """
-    # 1. Return cache if still fresh
-    if _price_cache["price"] is not None and             (time.time() - _price_cache["ts"]) < PRICE_CACHE_TTL:
+    now       = time.time()
+    cache_age = now - _price_cache["ts"] if _price_cache["ts"] else 9999
+
+    # 1. Return cache if fresh
+    if _price_cache["price"] is not None and cache_age < PRICE_CACHE_TTL:
         return _price_cache["price"], _price_cache["spread"]
 
-    # 2. Derive from M1 candle cache if available (costs 0 API calls)
+    # 2. Derive from M1 candle cache if candle itself is fresh
     m1_cached = _candle_cache.get(("M1", 100))
-    if m1_cached and (time.time() - m1_cached[1]) < CANDLE_CACHE_TTL:
+    if m1_cached and (now - m1_cached[1]) < 90:
         try:
             price = float(m1_cached[0]["close"].iloc[-1])
-            _price_cache.update({"price": price, "spread": 0.3, "ts": time.time()})
+            _price_cache.update({"price": price, "spread": 0.3, "ts": now})
             return price, 0.3
         except Exception:
             pass
 
-    # 3. Try M15 candle cache as fallback
+    # 3. Try M15 candle cache if fresh
     m15_cached = _candle_cache.get(("M15", 200))
-    if m15_cached and (time.time() - m15_cached[1]) < CANDLE_CACHE_TTL:
+    if m15_cached and (now - m15_cached[1]) < 120:
         try:
             price = float(m15_cached[0]["close"].iloc[-1])
-            _price_cache.update({"price": price, "spread": 0.3, "ts": time.time()})
+            _price_cache.update({"price": price, "spread": 0.3, "ts": now})
             return price, 0.3
         except Exception:
             pass
 
-    # 4. Call the API — but handle 429 gracefully
+    # 4. Call the API
     try:
         params = {"symbol": SYMBOL, "apikey": TWELVE_DATA_API_KEY}
         resp   = requests.get(f"{TWELVE_DATA_URL}/price", params=params, timeout=10)
+
         if resp.status_code == 429:
-            # Rate limited — return last known price if we have one
-            if _price_cache["price"] is not None:
-                print("[Price] 429 rate limit — returning cached price")
+            if _price_cache["price"] is not None and cache_age < PRICE_STALE_TTL:
+                print(f"[Price] 429 — using cache ({int(cache_age)}s old)")
                 return _price_cache["price"], _price_cache["spread"]
-            raise ValueError("Rate limited by Twelve Data and no cached price available. "
-                             "Wait a minute and try again.")
+            # Cache too stale — clear it so UI shows error not frozen price
+            _price_cache["price"] = None
+            raise ValueError(f"Rate limited. Cache {int(cache_age)}s old — too stale.")
+
         resp.raise_for_status()
-        data  = resp.json()
+        data = resp.json()
         if "price" not in data:
             raise ValueError(f"Twelve Data error: {data.get('message', 'No price data')}")
+
         price  = float(data["price"])
         spread = 0.3
-        _price_cache.update({"price": price, "spread": spread, "ts": time.time()})
+        _price_cache.update({"price": price, "spread": spread, "ts": now})
+        print(f"[Price] Updated: ${price:.2f}")
         return price, spread
+
     except requests.exceptions.HTTPError as e:
-        if _price_cache["price"] is not None:
-            print(f"[Price] API error ({e}) — returning cached price")
+        if _price_cache["price"] is not None and cache_age < PRICE_STALE_TTL:
+            print(f"[Price] API error ({e}) — cache ({int(cache_age)}s old)")
             return _price_cache["price"], _price_cache["spread"]
         raise
 
@@ -522,6 +532,94 @@ def find_support_resistance(df: pd.DataFrame) -> dict:
         "nearest_support":    round(nearest_sup, 2),
         "dist_to_resistance_pct": round(dist_res, 2),
         "dist_to_support_pct":    round(dist_sup, 2),
+    }
+
+
+def calculate_smart_sltp(price: float, signal: str, atr: float,
+                          nearest_support: float, nearest_resistance: float,
+                          regime: str, mode: str = "swing") -> dict:
+    """
+    Smart SL/TP calculation using structure + ATR + regime.
+
+    Logic:
+    1. Place SL just beyond nearest support/resistance (structure-aware)
+    2. Apply ATR-based minimum distance so SL is never too tight
+    3. Adjust multipliers based on market regime (volatile = wider)
+    4. Enforce minimum $3 SL distance for gold
+    5. Calculate TP to maintain minimum 1:2 RR
+    6. Scalp uses tighter multipliers than swing
+    """
+    MIN_SL_DISTANCE = 3.0   # gold minimum $3 SL
+    BUFFER          = 0.30  # $0.30 buffer beyond S/R level
+
+    # ── Regime-based ATR multipliers ─────────────────────────────────
+    if mode == "scalp":
+        regime_multipliers = {
+            "VOLATILE":      (1.8, 3.6),
+            "TRENDING_BULL": (1.3, 2.6),
+            "TRENDING_BEAR": (1.3, 2.6),
+            "WEAK_TREND":    (1.3, 2.6),
+            "RANGING":       (1.2, 2.4),
+        }
+    else:  # swing
+        regime_multipliers = {
+            "VOLATILE":      (2.2, 4.4),
+            "TRENDING_BULL": (1.5, 3.0),
+            "TRENDING_BEAR": (1.5, 3.0),
+            "WEAK_TREND":    (1.5, 3.0),
+            "RANGING":       (1.2, 2.4),
+        }
+
+    sl_mult, tp_mult = regime_multipliers.get(regime, (1.5, 3.0))
+    atr_sl_dist = atr * sl_mult
+    atr_sl_dist = max(atr_sl_dist, MIN_SL_DISTANCE)
+
+    if signal == "BUY":
+        # SL: just below nearest support, but at least ATR-based distance
+        if nearest_support and nearest_support < price:
+            structure_sl = nearest_support - BUFFER
+            # Use whichever gives a wider (safer) SL
+            sl_distance  = max(price - structure_sl, atr_sl_dist)
+        else:
+            sl_distance  = atr_sl_dist
+        stop_loss   = round(price - sl_distance, 2)
+        take_profit = round(price + sl_distance * (tp_mult / sl_mult), 2)
+
+    elif signal == "SELL":
+        # SL: just above nearest resistance, but at least ATR-based distance
+        if nearest_resistance and nearest_resistance > price:
+            structure_sl = nearest_resistance + BUFFER
+            sl_distance  = max(structure_sl - price, atr_sl_dist)
+        else:
+            sl_distance  = atr_sl_dist
+        stop_loss   = round(price + sl_distance, 2)
+        take_profit = round(price - sl_distance * (tp_mult / sl_mult), 2)
+
+    else:
+        return {"stop_loss": None, "take_profit": None, "risk_reward": "N/A",
+                "sl_method": "none", "sl_distance": 0}
+
+    # ── RR calculation ────────────────────────────────────────────────
+    risk   = abs(price - stop_loss)
+    reward = abs(take_profit - price)
+    rr     = round(reward / risk, 1) if risk > 0 else 2.0
+
+    # ── Label which method set the SL ────────────────────────────────
+    if signal == "BUY" and nearest_support:
+        used_structure = (price - stop_loss) > atr_sl_dist
+    elif signal == "SELL" and nearest_resistance:
+        used_structure = (stop_loss - price) > atr_sl_dist
+    else:
+        used_structure = False
+
+    sl_method = f"structure+ATR({regime})" if used_structure else f"ATR({regime})"
+
+    return {
+        "stop_loss":   stop_loss,
+        "take_profit": take_profit,
+        "risk_reward": f"1:{rr}",
+        "sl_method":   sl_method,
+        "sl_distance": round(risk, 2),
     }
 
 
@@ -1258,6 +1356,10 @@ def generate_gold_signal(df_1h: pd.DataFrame, df_4h: pd.DataFrame,
             "4h":    tf_4h_signal,
             "daily": tf_daily,
         },
+        "sl_method":          sltp.get("sl_method", "ATR"),
+        "sl_distance":        sltp.get("sl_distance", 0),
+        "sl_method":          sltp.get("sl_method", "ATR"),
+        "sl_distance":        sltp.get("sl_distance", 0),
         "nearest_support":    sr["nearest_support"],
         "nearest_resistance": sr["nearest_resistance"],
         "dist_to_resistance_pct": sr["dist_to_resistance_pct"],
@@ -1435,23 +1537,25 @@ def compute_swing_signal() -> dict:
 
     retest_confirmed = main.get("retest_buy") if final_signal == "BUY" else main.get("retest_sell")
 
-    # ── SL/TP (ATR-based, gold pip sizing) ───────────────────────────
-    atr = main["atr"]
+    # ── SL/TP (structure-aware + regime-adjusted) ────────────────────
+    atr       = main["atr"]
+    regime    = main.get("market_regime", "WEAK_TREND")
+    ns        = main.get("nearest_support")    or 0
+    nr        = main.get("nearest_resistance") or 0
     sl_tp_dir = final_signal if final_signal != "HOLD" else raw_signal
-    if sl_tp_dir == "BUY":
-        stop_loss   = round(price - atr * 1.5, 2)
-        take_profit = round(price + atr * 3.0, 2)
-    elif sl_tp_dir == "SELL":
-        stop_loss   = round(price + atr * 1.5, 2)
-        take_profit = round(price - atr * 3.0, 2)
-    else:
-        stop_loss = take_profit = None
 
-    risk_reward = "1:2.0"
-    if stop_loss and take_profit:
-        risk   = abs(price - stop_loss)
-        reward = abs(take_profit - price)
-        risk_reward = f"1:{round(reward / risk, 1)}" if risk > 0 else "1:2.0"
+    sltp = calculate_smart_sltp(
+        price            = price,
+        signal           = sl_tp_dir,
+        atr              = atr,
+        nearest_support  = ns,
+        nearest_resistance = nr,
+        regime           = regime,
+        mode             = "swing",
+    )
+    stop_loss   = sltp["stop_loss"]
+    take_profit = sltp["take_profit"]
+    risk_reward = sltp["risk_reward"]
 
     # ── Strength label ────────────────────────────────────────────────
     conf = int(str(main["confidence"]).replace("%", ""))
@@ -1649,16 +1753,23 @@ def compute_scalp_signal() -> dict:
             candle_blocked = True
             final_signal   = "HOLD"
 
-    # ── SL/TP (tight for scalp) ───────────────────────────────────────
+    # ── SL/TP (structure-aware + regime-adjusted, tight for scalp) ──
+    sr_scalp  = find_support_resistance(df_15m)
+    regime_sc = detect_market_regime(df_5m)["regime"]
     sl_tp_dir = final_signal if final_signal != "HOLD" else raw_signal
-    if sl_tp_dir == "BUY":
-        stop_loss   = round(price - atr * 1.0, 2)
-        take_profit = round(price + atr * 2.0, 2)
-    elif sl_tp_dir == "SELL":
-        stop_loss   = round(price + atr * 1.0, 2)
-        take_profit = round(price - atr * 2.0, 2)
-    else:
-        stop_loss = take_profit = None
+
+    sltp = calculate_smart_sltp(
+        price              = price,
+        signal             = sl_tp_dir,
+        atr                = atr,
+        nearest_support    = sr_scalp["nearest_support"],
+        nearest_resistance = sr_scalp["nearest_resistance"],
+        regime             = regime_sc,
+        mode               = "scalp",
+    )
+    stop_loss   = sltp["stop_loss"]
+    take_profit = sltp["take_profit"]
+    risk_reward = sltp.get("risk_reward", "1:2.0")
 
     return {
         "mode":             "SCALP",
@@ -2492,6 +2603,19 @@ async def paper_trade_resolver():
             price, _ = get_current_price()
             now = datetime.now(timezone.utc)
 
+            # Get recent candle high/low to catch sharp wicks between scan cycles
+            # e.g. price drops $30 in 1 min and recovers — current price misses it
+            recent_high = price
+            recent_low  = price
+            try:
+                m1 = _candle_cache.get(("M1", 100))
+                if m1 is not None:
+                    df_m1 = m1[0].tail(6)  # last 6 min of M1 candles
+                    recent_high = float(df_m1["high"].max())
+                    recent_low  = float(df_m1["low"].min())
+            except Exception:
+                pass
+
             def _resolve(log_list, log_file, max_hours):
                 changed = False
                 for trade in log_list:
@@ -2512,11 +2636,17 @@ async def paper_trade_resolver():
 
                     outcome = exit_price = None
                     if sig == "BUY":
-                        if price <= sl:   outcome, exit_price = "LOSS", sl
-                        elif price >= tp: outcome, exit_price = "WIN",  tp
+                        # Use candle low to catch sharp drops within the scan window
+                        if min(price, recent_low) <= sl:
+                            outcome, exit_price = "LOSS", sl
+                        elif max(price, recent_high) >= tp:
+                            outcome, exit_price = "WIN",  tp
                     elif sig == "SELL":
-                        if price >= sl:   outcome, exit_price = "LOSS", sl
-                        elif price <= tp: outcome, exit_price = "WIN",  tp
+                        # Use candle high to catch sharp spikes within the scan window
+                        if max(price, recent_high) >= sl:
+                            outcome, exit_price = "LOSS", sl
+                        elif min(price, recent_low) <= tp:
+                            outcome, exit_price = "WIN",  tp
 
                     if outcome is None and age_hrs >= max_hours:
                         outcome, exit_price = "EXPIRED", price
