@@ -269,7 +269,7 @@ news_log:      list = _load_json(NEWS_LOG_FILE)
 _candle_cache: dict = {}   # key: (granularity, count) → (df, timestamp)
 _price_cache:  dict = {"price": None, "spread": 0.3, "ts": 0.0}
 
-CANDLE_CACHE_TTL = 300   # seconds — candles refreshed every 5 min
+CANDLE_CACHE_TTL = 600   # seconds — candles refreshed every 10 min
 PRICE_CACHE_TTL  = 60    # seconds — price refreshed every 60 sec
 PRICE_STALE_TTL  = 180   # seconds — after this, price is dangerously stale
 
@@ -2207,7 +2207,7 @@ async def startup_event():
 
 async def background_scanner():
     """Runs every 5 minutes — scans swing + scalp signals and logs them."""
-    await asyncio.sleep(10)  # wait for server to fully start
+    await asyncio.sleep(90)  # wait for server + rate limit recovery
 
     while True:
         try:
@@ -2289,7 +2289,7 @@ async def background_scanner():
         except Exception as e:
             print(f"[Gold Scanner] {e}")
 
-        await asyncio.sleep(300)  # 5 min cycle
+        await asyncio.sleep(600)  # 10 min cycle
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2637,7 +2637,7 @@ def download_scalp_report():
 # ══════════════════════════════════════════════════════════════════════
 async def paper_trade_resolver():
     """Every 5 min: auto-close open paper trades vs live price."""
-    await asyncio.sleep(30)
+    await asyncio.sleep(180)  # wait 3 min before first resolve
     while True:
         try:
             # Force fresh M1 candles before resolving for accurate wick detection
@@ -2723,7 +2723,7 @@ async def paper_trade_resolver():
             _resolve(scalp_log,  SCALP_LOG_FILE,  max_hours=4)
         except Exception as e:
             print(f"[Resolver] Error: {e}")
-        await asyncio.sleep(300)
+        await asyncio.sleep(600)  # 10 min cycle
 
 
 # ══════════════════════════════════════════════════════════════════════
