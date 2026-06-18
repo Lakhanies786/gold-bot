@@ -266,7 +266,32 @@ _candle_cache: dict = {}   # key: (granularity, count) → (df, timestamp)
 _price_cache:  dict = {"price": None, "spread": 0.3, "ts": 0.0}
 
 CANDLE_CACHE_TTL = 300   # seconds — candles refreshed every 5 min
-PRICE_CACHE_TTL  = 300   # seconds — price refreshed every 5 min (from M1 candle)
+PRICE_CACHE_TTL  = 60    # seconds — price refreshed every 60 sec
+PRICE_STALE_TTL  = 180   # seconds — after this, price is dangerously stale
+
+def get_fresh_price() -> tuple:
+    """Force fresh price at signal log time for accurate entry price.
+    Tries M1 candle first (free), then API, then falls back to cache.
+    """
+    try:
+        df_m1 = get_oanda_candles("M1", 10)
+        price = float(df_m1["close"].iloc[-1])
+        _price_cache.update({"price": price, "spread": 0.3, "ts": time.time()})
+        return price, 0.3
+    except Exception:
+        pass
+    try:
+        params = {"symbol": SYMBOL, "apikey": TWELVE_DATA_API_KEY}
+        resp   = requests.get(f"{TWELVE_DATA_URL}/price", params=params, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "price" in data:
+                price = float(data["price"])
+                _price_cache.update({"price": price, "spread": 0.3, "ts": time.time()})
+                return price, 0.3
+    except Exception:
+        pass
+    return get_current_price()
 
 
 def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
@@ -2598,19 +2623,27 @@ async def paper_trade_resolver():
     await asyncio.sleep(30)
     while True:
         try:
+            # Force fresh M1 candles before resolving for accurate wick detection
+            try:
+                get_oanda_candles("M1", 20)
+            except Exception:
+                pass
+
             price, _ = get_current_price()
             now = datetime.now(timezone.utc)
 
-            # Get recent candle high/low to catch sharp wicks between scan cycles
-            # e.g. price drops $30 in 1 min and recovers — current price misses it
+            # Use M1 high/low to catch sharp wicks between scan cycles
             recent_high = price
             recent_low  = price
             try:
                 m1 = _candle_cache.get(("M1", 100))
                 if m1 is not None:
-                    df_m1 = m1[0].tail(6)  # last 6 min of M1 candles
-                    recent_high = float(df_m1["high"].max())
-                    recent_low  = float(df_m1["low"].min())
+                    df_m1 = m1[0].tail(10)  # last 10 min of M1 candles
+                    recent_high  = float(df_m1["high"].max())
+                    recent_low   = float(df_m1["low"].min())
+                    latest_close = float(m1[0]["close"].iloc[-1])
+                    if abs(latest_close - price) < 50:  # sanity check
+                        price = latest_close
             except Exception:
                 pass
 
