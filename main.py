@@ -190,12 +190,24 @@ SCALP_LOG_FILE     = str(_BASE_DIR / "gold_scalp_log.json")
 SCALP_BLOCKED_FILE = str(_BASE_DIR / "gold_scalp_blocked.json")
 NEWS_LOG_FILE      = str(_BASE_DIR / "gold_news_blocked_log.json")  # separate news event log
 
-# ── Twelve Data API Config ────────────────────────────────────────────
-# Get free API key at: twelvedata.com — no credit card needed
-# Free tier: 800 requests/day, 8/minute — more than enough for this bot
+# ── Data Provider Config ───────────────────────────────────────────────
+# Primary: AllTick (1000 req/day free, 10/min, WebSocket support, gold-specific)
+# Fallback: Twelve Data (800 req/day) — used automatically if AllTick fails
+ALLTICK_TOKEN    = os.getenv("ALLTICK_TOKEN", "")
+ALLTICK_URL      = "https://quote.alltick.co/quote-b-api/kline"
+ALLTICK_TICK_URL = "https://quote.alltick.co/quote-b-api/trade-tick"
+ALLTICK_SYMBOL   = "GOLD"
+# AllTick free tier: 1000 req/day, 10/min — gives headroom for faster scans
+# Twelve Data free tier: 800 req/day, 8/min — needs slower scans to avoid 429
+
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
 TWELVE_DATA_URL     = "https://api.twelvedata.com"
-SYMBOL              = "XAU/USD"   # Gold spot price
+SYMBOL              = "XAU/USD"   # Gold spot price (Twelve Data fallback)
+
+USE_ALLTICK = bool(ALLTICK_TOKEN)  # auto-detect which provider to use
+
+# Dynamic scan cycle — faster if AllTick available, safer if only Twelve Data
+SCAN_CYCLE_SECONDS = 120 if USE_ALLTICK else 600  # 2 min vs 10 min
 
 # ── Twelve Data timeframe map ─────────────────────────────────────────
 TF_MAP = {
@@ -205,6 +217,17 @@ TF_MAP = {
     "H1":  "1h",
     "H4":  "4h",
     "D":   "1day",
+}
+
+# ── AllTick kline_type map ─────────────────────────────────────────────
+# 1=1min 2=5min 3=15min 4=30min 5=1h 6=2h 7=4h 8=daily
+ALLTICK_TF_MAP = {
+    "M1":  1,
+    "M5":  2,
+    "M15": 3,
+    "H1":  5,
+    "H4":  7,
+    "D":   8,
 }
 
 # ── Filter Thresholds ─────────────────────────────────────────────────
@@ -269,8 +292,8 @@ news_log:      list = _load_json(NEWS_LOG_FILE)
 _candle_cache: dict = {}   # key: (granularity, count) → (df, timestamp)
 _price_cache:  dict = {"price": None, "spread": 0.3, "ts": 0.0}
 
-CANDLE_CACHE_TTL = 600   # seconds — candles refreshed every 10 min
-PRICE_CACHE_TTL  = 60    # seconds — price refreshed every 60 sec
+CANDLE_CACHE_TTL = 90 if USE_ALLTICK else 600  # 90s with AllTick, 10min with Twelve Data only
+PRICE_CACHE_TTL  = 20 if USE_ALLTICK else 60  # 20s AllTick, 60s Twelve Data only
 PRICE_STALE_TTL  = 180   # seconds — after this, price is dangerously stale
 
 def get_fresh_price() -> tuple:
@@ -298,10 +321,75 @@ def get_fresh_price() -> tuple:
     return get_current_price()
 
 
+def _fetch_alltick_kline(granularity: str, count: int = 200) -> pd.DataFrame:
+    """Fetch gold candles from AllTick (1000 req/day free, no PC needed)."""
+    kline_type = ALLTICK_TF_MAP.get(granularity, 5)
+    query_obj = {
+        "trace": f"goldbot-{int(time.time()*1000)}",
+        "data": {
+            "code": ALLTICK_SYMBOL,
+            "kline_type": kline_type,
+            "kline_timestamp_end": 0,
+            "query_kline_num": min(count, 500),
+            "adjust_type": 0,
+        },
+    }
+    query_str = json.dumps(query_obj)
+    params = {"token": ALLTICK_TOKEN, "query": query_str}
+    resp = requests.get(ALLTICK_URL, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("ret") != 200:
+        raise ValueError(f"AllTick error: {data.get('msg', 'unknown error')}")
+
+    kline_list = data.get("data", {}).get("kline_list", [])
+    if not kline_list:
+        raise ValueError("AllTick returned no kline data")
+
+    rows = []
+    for c in kline_list:
+        rows.append({
+            "time":   pd.to_datetime(int(c["timestamp"]), unit="s"),
+            "open":   float(c["open_price"]),
+            "high":   float(c["high_price"]),
+            "low":    float(c["low_price"]),
+            "close":  float(c["close_price"]),
+            "volume": float(c.get("volume", 1000) or 1000),
+        })
+    df = pd.DataFrame(rows)
+    df.set_index("time", inplace=True)
+    df.sort_index(inplace=True)
+    return df
+
+
+def _fetch_alltick_price() -> tuple:
+    """Fetch latest gold price from AllTick trade-tick endpoint."""
+    query_obj = {
+        "trace": f"goldbot-{int(time.time()*1000)}",
+        "data": {"symbol_list": [{"code": ALLTICK_SYMBOL}]},
+    }
+    query_str = json.dumps(query_obj)
+    params = {"token": ALLTICK_TOKEN, "query": query_str}
+    resp = requests.get(ALLTICK_TICK_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("ret") != 200:
+        raise ValueError(f"AllTick error: {data.get('msg', 'unknown error')}")
+
+    tick_list = data.get("data", {}).get("tick_list", [])
+    if not tick_list:
+        raise ValueError("AllTick returned no tick data")
+
+    price = float(tick_list[0]["price"])
+    return price, 0.3
+
+
 def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
     """
-    Fetch XAU/USD candles from Twelve Data with caching.
-    Returns cached data if last fetch was within CANDLE_CACHE_TTL seconds.
+    Fetch XAU/USD candles — tries AllTick first (if token set), falls back
+    to Twelve Data automatically. Returns cached data if fresh.
     granularity: M1, M5, M15, H1, H4, D
     """
     cache_key = (granularity, count)
@@ -309,6 +397,16 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
     if cached and (time.time() - cached[1]) < CANDLE_CACHE_TTL:
         return cached[0]
 
+    # ── Try AllTick first ───────────────────────────────────────────
+    if USE_ALLTICK:
+        try:
+            df = _fetch_alltick_kline(granularity, count)
+            _candle_cache[cache_key] = (df, time.time())
+            return df
+        except Exception as e:
+            print(f"[Candles] AllTick failed ({e}) — falling back to Twelve Data")
+
+    # ── Fallback: Twelve Data ────────────────────────────────────────
     interval = TF_MAP.get(granularity, "1h")
     params   = {
         "symbol":     SYMBOL,
@@ -320,7 +418,6 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
     }
     resp = requests.get(f"{TWELVE_DATA_URL}/time_series", params=params, timeout=15)
     if resp.status_code == 429:
-        # Rate limited — return stale cache if available rather than crashing
         if cached:
             print(f"[Candles] 429 rate limit for {granularity} — returning stale cache")
             return cached[0]
@@ -353,11 +450,12 @@ def get_current_price() -> tuple:
 
     Priority:
     1. Cache if fresh (< 60s)
-    2. Fresh M1 candle close (< 90s old) — free, no API call
-    3. Fresh M15 candle close (< 120s old) — free
-    4. Twelve Data /price API call
-    5. Stale cache if < 3 min old (on 429)
-    6. Error if cache > 3 min old — prevents stuck price display
+    2. AllTick live tick (if token set) — most accurate, free
+    3. Fresh M1 candle close (< 90s old) — free, no API call
+    4. Fresh M15 candle close (< 120s old) — free
+    5. Twelve Data /price API call (fallback)
+    6. Stale cache if < 3 min old
+    7. Error if cache > 3 min old — prevents stuck price display
     """
     now       = time.time()
     cache_age = now - _price_cache["ts"] if _price_cache["ts"] else 9999
@@ -366,7 +464,16 @@ def get_current_price() -> tuple:
     if _price_cache["price"] is not None and cache_age < PRICE_CACHE_TTL:
         return _price_cache["price"], _price_cache["spread"]
 
-    # 2. Derive from M1 candle cache if candle itself is fresh
+    # 2. Try AllTick live tick — most accurate, near real-time
+    if USE_ALLTICK:
+        try:
+            price, spread = _fetch_alltick_price()
+            _price_cache.update({"price": price, "spread": spread, "ts": now})
+            return price, spread
+        except Exception as e:
+            print(f"[Price] AllTick failed ({e}) — trying candle cache")
+
+    # 3. Derive from M1 candle cache if candle itself is fresh
     m1_cached = _candle_cache.get(("M1", 100))
     if m1_cached and (now - m1_cached[1]) < 90:
         try:
@@ -376,7 +483,7 @@ def get_current_price() -> tuple:
         except Exception:
             pass
 
-    # 3. Try M15 candle cache if fresh
+    # 4. Try M15 candle cache if fresh
     m15_cached = _candle_cache.get(("M15", 200))
     if m15_cached and (now - m15_cached[1]) < 120:
         try:
@@ -386,7 +493,7 @@ def get_current_price() -> tuple:
         except Exception:
             pass
 
-    # 4. Call the API
+    # 5. Call Twelve Data API (fallback)
     try:
         params = {"symbol": SYMBOL, "apikey": TWELVE_DATA_API_KEY}
         resp   = requests.get(f"{TWELVE_DATA_URL}/price", params=params, timeout=10)
@@ -395,7 +502,6 @@ def get_current_price() -> tuple:
             if _price_cache["price"] is not None and cache_age < PRICE_STALE_TTL:
                 print(f"[Price] 429 — using cache ({int(cache_age)}s old)")
                 return _price_cache["price"], _price_cache["spread"]
-            # Cache too stale — clear it so UI shows error not frozen price
             _price_cache["price"] = None
             raise ValueError(f"Rate limited. Cache {int(cache_age)}s old — too stale.")
 
@@ -579,16 +685,18 @@ def calculate_smart_sltp(price: float, signal: str, atr: float,
     6. Scalp uses tighter multipliers than swing
     """
     MIN_SL_DISTANCE = 3.0   # gold minimum $3 SL
+    MAX_SL_DISTANCE = 8.0 if mode == "scalp" else 35.0  # scalp max $8, swing max $35
     BUFFER          = 0.30  # $0.30 buffer beyond S/R level
 
     # ── Regime-based ATR multipliers ─────────────────────────────────
     if mode == "scalp":
+        # Scalp needs tight SL/TP — gold should hit these within 30-60 min
         regime_multipliers = {
-            "VOLATILE":      (1.8, 3.6),
-            "TRENDING_BULL": (1.3, 2.6),
-            "TRENDING_BEAR": (1.3, 2.6),
-            "WEAK_TREND":    (1.3, 2.6),
-            "RANGING":       (1.2, 2.4),
+            "VOLATILE":      (1.2, 2.4),
+            "TRENDING_BULL": (0.8, 1.6),
+            "TRENDING_BEAR": (0.8, 1.6),
+            "WEAK_TREND":    (0.8, 1.6),
+            "RANGING":       (0.7, 1.4),
         }
     else:  # swing
         regime_multipliers = {
@@ -607,10 +715,11 @@ def calculate_smart_sltp(price: float, signal: str, atr: float,
         # SL: just below nearest support, but at least ATR-based distance
         if nearest_support and nearest_support < price:
             structure_sl = nearest_support - BUFFER
-            # Use whichever gives a wider (safer) SL
             sl_distance  = max(price - structure_sl, atr_sl_dist)
         else:
             sl_distance  = atr_sl_dist
+        # Cap scalp SL so it's never too wide
+        sl_distance = min(sl_distance, MAX_SL_DISTANCE)
         stop_loss   = round(price - sl_distance, 2)
         take_profit = round(price + sl_distance * (tp_mult / sl_mult), 2)
 
@@ -621,6 +730,8 @@ def calculate_smart_sltp(price: float, signal: str, atr: float,
             sl_distance  = max(structure_sl - price, atr_sl_dist)
         else:
             sl_distance  = atr_sl_dist
+        # Cap scalp SL so it's never too wide
+        sl_distance = min(sl_distance, MAX_SL_DISTANCE)
         stop_loss   = round(price + sl_distance, 2)
         take_profit = round(price - sl_distance * (tp_mult / sl_mult), 2)
 
@@ -2289,7 +2400,7 @@ async def background_scanner():
         except Exception as e:
             print(f"[Gold Scanner] {e}")
 
-        await asyncio.sleep(600)  # 10 min cycle
+        await asyncio.sleep(SCAN_CYCLE_SECONDS)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2304,9 +2415,45 @@ def root():
 def health():
     try:
         price, spread = get_current_price()
-        return {"status": "ok ✅", "symbol": SYMBOL, "xauusd_price": price, "spread_pips": spread}
+        return {
+            "status":        "ok ✅",
+            "symbol":        SYMBOL,
+            "xauusd_price":  price,
+            "spread_pips":   spread,
+            "data_provider": "AllTick" if USE_ALLTICK else "Twelve Data",
+            "scan_cycle":    f"{SCAN_CYCLE_SECONDS}s",
+        }
     except Exception as e:
-        return {"status": "error ❌", "symbol": SYMBOL, "error": str(e)}
+        return {
+            "status": "error ❌",
+            "symbol": SYMBOL,
+            "error":  str(e),
+            "data_provider": "AllTick" if USE_ALLTICK else "Twelve Data",
+        }
+
+
+@app.get("/data-source")
+def data_source_status():
+    """Debug endpoint — confirms which data provider is active and tests it."""
+    result = {
+        "alltick_token_set": bool(ALLTICK_TOKEN),
+        "active_provider":   "AllTick" if USE_ALLTICK else "Twelve Data",
+        "scan_cycle_seconds": SCAN_CYCLE_SECONDS,
+        "candle_cache_ttl":  CANDLE_CACHE_TTL,
+        "price_cache_ttl":   PRICE_CACHE_TTL,
+    }
+    if USE_ALLTICK:
+        try:
+            price, spread = _fetch_alltick_price()
+            result["alltick_test"] = {"status": "✅ working", "price": price}
+        except Exception as e:
+            result["alltick_test"] = {"status": "❌ failed", "error": str(e)}
+        try:
+            df = _fetch_alltick_kline("M5", 5)
+            result["alltick_kline_test"] = {"status": "✅ working", "last_close": float(df["close"].iloc[-1])}
+        except Exception as e:
+            result["alltick_kline_test"] = {"status": "❌ failed", "error": str(e)}
+    return result
 
 @app.get("/instruments")
 def list_instruments():
@@ -2640,14 +2787,25 @@ async def paper_trade_resolver():
     await asyncio.sleep(180)  # wait 3 min before first resolve
     while True:
         try:
-            # Force fresh M1 candles before resolving for accurate wick detection
+            # Try fresh M1 candles — but don't fail if rate limited
             try:
                 get_oanda_candles("M1", 20)
             except Exception:
                 pass
 
-            price, _ = get_current_price()
+            # Use cached price if available — never skip resolver due to rate limit
             now = datetime.now(timezone.utc)
+            try:
+                price, _ = get_current_price()
+            except Exception:
+                # Fall back to whatever is in cache
+                if _price_cache["price"] is not None:
+                    price = _price_cache["price"]
+                    print(f"[Resolver] Using cached price ${price:.2f}")
+                else:
+                    print("[Resolver] No price available — skipping this cycle")
+                    await asyncio.sleep(600)
+                    continue
 
             # Use M1 high/low to catch sharp wicks between scan cycles
             recent_high = price
@@ -2720,10 +2878,10 @@ async def paper_trade_resolver():
                     _save_json(log_file, log_list)
 
             _resolve(signal_log, SIGNAL_LOG_FILE, max_hours=48)
-            _resolve(scalp_log,  SCALP_LOG_FILE,  max_hours=4)
+            _resolve(scalp_log,  SCALP_LOG_FILE,  max_hours=1 if USE_ALLTICK else 2)
         except Exception as e:
             print(f"[Resolver] Error: {e}")
-        await asyncio.sleep(600)  # 10 min cycle
+        await asyncio.sleep(SCAN_CYCLE_SECONDS)
 
 
 # ══════════════════════════════════════════════════════════════════════
