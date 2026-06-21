@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -405,8 +406,41 @@ def get_fresh_price() -> tuple:
     return get_current_price()
 
 
+# ── AllTick global rate limiter (1 req/sec per token, documented limit) ─
+# A single shared timestamp + lock ensures every AllTick call anywhere in
+# the app — whether from compute_swing_signal()'s 4 sequential candle
+# fetches, compute_scalp_signal()'s 3, the resolver, or get_fresh_price()
+# — waits long enough since the last AllTick call before firing the next
+# one. Without this, calls landing in the same second get silently
+# rejected with 429 regardless of remaining daily quota.
+_alltick_last_call_ts = 0.0
+_alltick_lock = threading.Lock()
+ALLTICK_MIN_INTERVAL = 1.05  # seconds — slightly over 1.0 for safety margin
+
+
+def _alltick_rate_limit_wait():
+    """Block just long enough to respect AllTick's 1 req/sec limit."""
+    global _alltick_last_call_ts
+    with _alltick_lock:
+        now = time.time()
+        elapsed = now - _alltick_last_call_ts
+        if elapsed < ALLTICK_MIN_INTERVAL:
+            time.sleep(ALLTICK_MIN_INTERVAL - elapsed)
+        _alltick_last_call_ts = time.time()
+
+
 def _fetch_alltick_kline(granularity: str, count: int = 200) -> pd.DataFrame:
-    """Fetch gold candles from AllTick (1000 req/day free, no PC needed)."""
+    """Fetch gold candles from AllTick (1000 req/day free, no PC needed).
+
+    AllTick's documented limit is 1 request/second PER TOKEN — not just a
+    daily cap. If two calls land in the same second, the second is
+    rejected with 429 regardless of remaining daily quota. This is why
+    429s persisted even after per-timeframe caching: compute_swing_signal()
+    fires 4 sequential candle calls with zero delay between them, all
+    landing in the same second. _alltick_rate_limit_wait() below enforces
+    a minimum gap before every AllTick request so this can't happen.
+    """
+    _alltick_rate_limit_wait()
     kline_type = ALLTICK_TF_MAP.get(granularity, 5)
     query_obj = {
         "trace": f"goldbot-{int(time.time()*1000)}",
@@ -449,6 +483,7 @@ def _fetch_alltick_kline(granularity: str, count: int = 200) -> pd.DataFrame:
 
 def _fetch_alltick_price() -> tuple:
     """Fetch latest gold price from AllTick trade-tick endpoint."""
+    _alltick_rate_limit_wait()
     query_obj = {
         "trace": f"goldbot-{int(time.time()*1000)}",
         "data": {"symbol_list": [{"code": ALLTICK_SYMBOL}]},
