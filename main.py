@@ -417,6 +417,21 @@ _alltick_last_call_ts = 0.0
 _alltick_lock = threading.Lock()
 ALLTICK_MIN_INTERVAL = 1.05  # seconds — slightly over 1.0 for safety margin
 
+# ── AllTick usage tracking ──────────────────────────────────────────────
+# Tracks calls/429s per UTC calendar day so we can tell apart "burst
+# rate-limit" (now fixed) from "daily quota genuinely exhausted" (a
+# different problem the rate limiter above can't solve) — without needing
+# to find AllTick's own dashboard usage page.
+_alltick_usage = {"date": None, "success": 0, "rate_limited": 0, "other_error": 0}
+
+
+def _alltick_track_call(outcome: str):
+    """outcome: 'success' | 'rate_limited' | 'other_error'"""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _alltick_usage["date"] != today:
+        _alltick_usage.update({"date": today, "success": 0, "rate_limited": 0, "other_error": 0})
+    _alltick_usage[outcome] = _alltick_usage.get(outcome, 0) + 1
+
 
 def _alltick_rate_limit_wait():
     """Block just long enough to respect AllTick's 1 req/sec limit."""
@@ -455,16 +470,22 @@ def _fetch_alltick_kline(granularity: str, count: int = 200) -> pd.DataFrame:
     query_str = json.dumps(query_obj)
     params = {"token": ALLTICK_TOKEN, "query": query_str}
     resp = requests.get(ALLTICK_URL, params=params, timeout=15)
+    if resp.status_code == 429:
+        _alltick_track_call("rate_limited")
+        resp.raise_for_status()  # raises HTTPError, caught by caller's fallback
     resp.raise_for_status()
     data = resp.json()
 
     if data.get("ret") != 200:
+        _alltick_track_call("other_error")
         raise ValueError(f"AllTick error: {data.get('msg', 'unknown error')}")
 
     kline_list = data.get("data", {}).get("kline_list", [])
     if not kline_list:
+        _alltick_track_call("other_error")
         raise ValueError("AllTick returned no kline data")
 
+    _alltick_track_call("success")
     rows = []
     for c in kline_list:
         rows.append({
@@ -491,16 +512,22 @@ def _fetch_alltick_price() -> tuple:
     query_str = json.dumps(query_obj)
     params = {"token": ALLTICK_TOKEN, "query": query_str}
     resp = requests.get(ALLTICK_TICK_URL, params=params, timeout=10)
+    if resp.status_code == 429:
+        _alltick_track_call("rate_limited")
+        resp.raise_for_status()
     resp.raise_for_status()
     data = resp.json()
 
     if data.get("ret") != 200:
+        _alltick_track_call("other_error")
         raise ValueError(f"AllTick error: {data.get('msg', 'unknown error')}")
 
     tick_list = data.get("data", {}).get("tick_list", [])
     if not tick_list:
+        _alltick_track_call("other_error")
         raise ValueError("AllTick returned no tick data")
 
+    _alltick_track_call("success")
     price = float(tick_list[0]["price"])
     return price, 0.3
 
@@ -2646,6 +2673,38 @@ def data_source_status():
         except Exception as e:
             result["alltick_kline_test"] = {"status": "❌ failed", "error": str(e)}
     return result
+
+
+@app.get("/alltick-usage")
+def alltick_usage():
+    """
+    Read-only — shows today's AllTick call counts WITHOUT making any new
+    API calls (unlike /data-source which does test fetches). Use this to
+    tell apart 'burst rate-limit' (now fixed by the 1 req/sec limiter)
+    from 'daily quota genuinely exhausted' (a separate problem — only
+    fixable by waiting for reset or upgrading the AllTick plan).
+    """
+    total = _alltick_usage["success"] + _alltick_usage["rate_limited"] + _alltick_usage["other_error"]
+    rate_limited_pct = round(_alltick_usage["rate_limited"] / total * 100, 1) if total else 0
+    diagnosis = "no calls made yet today"
+    if total > 0:
+        if rate_limited_pct > 30:
+            diagnosis = "HIGH 429 rate — likely daily quota exhausted, not a burst issue"
+        elif _alltick_usage["rate_limited"] > 0:
+            diagnosis = "some 429s — could be transient, monitor over next hour"
+        else:
+            diagnosis = "clean — no 429s today"
+    return {
+        "date_utc":        _alltick_usage["date"],
+        "successful_calls": _alltick_usage["success"],
+        "rate_limited_429": _alltick_usage["rate_limited"],
+        "other_errors":     _alltick_usage["other_error"],
+        "total_attempts":   total,
+        "rate_limited_pct": f"{rate_limited_pct}%",
+        "diagnosis":        diagnosis,
+        "note": "Counts reset when Railway restarts the container — not a persistent log, "
+                "just a live snapshot since this deploy started.",
+    }
 
 @app.get("/instruments")
 def list_instruments():
