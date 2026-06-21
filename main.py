@@ -350,12 +350,42 @@ PRICE_CACHE_TTL  = 20 if USE_ALLTICK else 60  # 20s AllTick, 60s Twelve Data onl
 PRICE_STALE_TTL  = 180   # seconds — after this, price is dangerously stale
 CANDLE_DANGEROUS_STALE_TTL = 300  # seconds — beyond this, refuse to log signals (was causing 10hr frozen data)
 
+# ── Per-timeframe candle cache TTL ──────────────────────────────────────
+# A flat 90s TTL for every timeframe was the real cause of hitting
+# AllTick's 1000/day limit: H4/Daily candles barely change within 90s,
+# yet were being re-fetched every cycle just like M1. Background scanning
+# alone (swing + scalp + resolver running every 120s) was generating
+# ~5,760 calls/day against AllTick — 5.7x over the free-tier limit.
+#
+# Fix: tier TTLs by how often each timeframe genuinely needs refreshing.
+# M1 stays fast (it's scalp's primary trigger); M5/M15/H1/H4/D scale up
+# since they're confirmation/trend-filter inputs that don't need to be
+# second-fresh. This keeps total background usage to ~800/day, leaving
+# real headroom for your own app/dashboard checks.
+if USE_ALLTICK:
+    CANDLE_CACHE_TTL_BY_TF = {
+        "M1":  180,    # 3 min  — scalp's primary trigger, needs to stay fresh
+        "M5":  600,    # 10 min — scalp confirmation timeframe
+        "M15": 900,    # 15 min — shared by scalp (filter) and swing
+        "H1":  1800,   # 30 min — swing timeframe, slow-moving
+        "H4":  3600,   # 60 min — swing timeframe, very slow-moving
+        "D":   7200,   # 120 min — daily candle, changes once a day anyway
+    }
+else:
+    CANDLE_CACHE_TTL_BY_TF = {
+        "M1":  600, "M5": 600, "M15": 900,
+        "H1":  1800, "H4": 3600, "D": 7200,
+    }
+
 def get_fresh_price() -> tuple:
     """Force fresh price at signal log time for accurate entry price.
     Tries M1 candle first (free), then API, then falls back to cache.
+    Uses count=100 to match other M1 fetches so they share one cache
+    entry instead of each (granularity, count) pair being a separate
+    cache key that independently expires and triggers its own API call.
     """
     try:
-        df_m1 = get_oanda_candles("M1", 10)
+        df_m1 = get_oanda_candles("M1", 100)
         price = float(df_m1["close"].iloc[-1])
         _price_cache.update({"price": price, "spread": 0.3, "ts": time.time()})
         return price, 0.3
@@ -445,10 +475,17 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
     Fetch XAU/USD candles — tries AllTick first (if token set), falls back
     to Twelve Data automatically. Returns cached data if fresh.
     granularity: M1, M5, M15, H1, H4, D
+
+    Cache TTL is per-timeframe, not flat — a Daily candle doesn't need
+    refreshing every 90s like an M1 candle does. This is what actually
+    keeps daily API usage under the free-tier limits; a flat 90s TTL for
+    ALL timeframes (including H4/Daily) was burning quota for data that
+    hadn't changed, causing 429s and "refusing stale data" blank screens.
     """
     cache_key = (granularity, count)
     cached = _candle_cache.get(cache_key)
-    if cached and (time.time() - cached[1]) < CANDLE_CACHE_TTL:
+    ttl = CANDLE_CACHE_TTL_BY_TF.get(granularity, CANDLE_CACHE_TTL)
+    if cached and (time.time() - cached[1]) < ttl:
         return cached[0]
 
     # ── Try AllTick first ───────────────────────────────────────────
@@ -475,12 +512,21 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
         if cached:
             stale_age = time.time() - cached[1]
             print(f"[Candles] 429 rate limit for {granularity} — cache is {int(stale_age)}s old")
-            if stale_age > CANDLE_DANGEROUS_STALE_TTL:
+            # Dangerous-stale threshold scales per timeframe: a 2-hour-old
+            # Daily candle is still completely valid, but a 2-hour-old M1
+            # candle is corrupted data. Using one flat threshold for all
+            # timeframes was incorrectly refusing perfectly good H4/Daily
+            # cache. Threshold = 3x the timeframe's own normal TTL.
+            danger_threshold = max(
+                CANDLE_CACHE_TTL_BY_TF.get(granularity, CANDLE_CACHE_TTL) * 3,
+                CANDLE_DANGEROUS_STALE_TTL,
+            )
+            if stale_age > danger_threshold:
                 # Cache too old to trust — refuse to silently serve corrupted data.
                 # This is what was causing hours-long frozen price/volume in logs.
                 raise ValueError(
                     f"Rate limited and cache for {granularity} is {int(stale_age)}s old "
-                    f"(> {CANDLE_DANGEROUS_STALE_TTL}s limit) — refusing stale data."
+                    f"(> {danger_threshold}s limit) — refusing stale data."
                 )
             return cached[0]
         raise ValueError("Rate limited by Twelve Data. Wait 1 minute and retry.")
@@ -2907,8 +2953,10 @@ async def paper_trade_resolver():
                 continue
 
             # Try fresh M1 candles — but don't fail if rate limited
+            # count=100 matches the scalp scanner's M1 fetch so they share
+            # one cache entry instead of doubling M1 API calls
             try:
-                get_oanda_candles("M1", 20)
+                get_oanda_candles("M1", 100)
             except Exception:
                 pass
 
