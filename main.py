@@ -74,10 +74,33 @@ def _init_db():
                     exit_price         REAL,
                     pnl_pct            REAL,
                     closed_at          TIMESTAMPTZ,
-                    bars_held          INTEGER
+                    bars_held          INTEGER,
+                    partial_closed     BOOLEAN DEFAULT FALSE,
+                    partial_exit_price REAL,
+                    partial_pnl_pct    REAL,
+                    partial_closed_at  TIMESTAMPTZ,
+                    sl_at_breakeven    BOOLEAN DEFAULT FALSE,
+                    original_stop_loss REAL
                 );
             """)
             conn.commit()
+            # Migration-safe: add new columns if table already existed from
+            # before partial-TP/break-even feature was introduced
+            for col_def in [
+                "partial_closed     BOOLEAN DEFAULT FALSE",
+                "partial_exit_price REAL",
+                "partial_pnl_pct    REAL",
+                "partial_closed_at  TIMESTAMPTZ",
+                "sl_at_breakeven    BOOLEAN DEFAULT FALSE",
+                "original_stop_loss REAL",
+            ]:
+                col_name = col_def.split()[0]
+                try:
+                    cur.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {col_def};")
+                    conn.commit()
+                except Exception as mig_err:
+                    print(f"[DB] Migration note for {col_name}: {mig_err}")
+                    conn.rollback()
         print("[DB] Tables ready ✅")
     except Exception as e:
         print(f"[DB] Init error: {e}")
@@ -98,7 +121,7 @@ def _db_insert_trade(entry: dict):
                     vol_ratio, spread, session, daily_bias, market_regime,
                     entry_price, stop_loss, take_profit, risk_reward,
                     nearest_support, nearest_resistance,
-                    status, outcome, exit_price, pnl_pct
+                    status, outcome, exit_price, pnl_pct, original_stop_loss
                 ) VALUES (
                     %(id)s, %(mode)s, %(logged_at)s, %(date)s, %(time_utc)s,
                     %(symbol)s, %(signal)s, %(grade)s, %(trade_allowed)s,
@@ -107,7 +130,7 @@ def _db_insert_trade(entry: dict):
                     %(market_regime)s, %(entry_price)s, %(stop_loss)s,
                     %(take_profit)s, %(risk_reward)s, %(nearest_support)s,
                     %(nearest_resistance)s, %(status)s, %(outcome)s,
-                    %(exit_price)s, %(pnl_pct)s
+                    %(exit_price)s, %(pnl_pct)s, %(stop_loss)s
                 ) ON CONFLICT (id) DO NOTHING;
             """, {**entry, "logged_at": entry.get("logged_at")})
             conn.commit()
@@ -134,6 +157,36 @@ def _db_close_trade(trade_id, outcome, exit_price, pnl_pct, closed_at, bars_held
         return True
     except Exception as e:
         print(f"[DB] Update error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _db_partial_close_trade(trade_id, partial_exit_price, partial_pnl_pct,
+                             partial_closed_at, new_stop_loss):
+    """Record a 50% partial take-profit + move remaining SL to break-even.
+    Trade stays OPEN — only stop_loss and the partial_* fields update.
+    """
+    conn = _get_db()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE trades SET
+                    partial_closed = TRUE,
+                    partial_exit_price = %s,
+                    partial_pnl_pct = %s,
+                    partial_closed_at = %s,
+                    stop_loss = %s,
+                    sl_at_breakeven = TRUE
+                WHERE id=%s AND status='OPEN' AND partial_closed = FALSE;
+            """, (partial_exit_price, partial_pnl_pct, partial_closed_at,
+                  new_stop_loss, trade_id))
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Partial close error: {e}")
         return False
     finally:
         conn.close()
@@ -2906,17 +2959,49 @@ async def paper_trade_resolver():
                     except Exception:
                         age_hrs = 0
 
+                    # ── Partial TP (50%) + move SL to break-even ──────────
+                    # Once price reaches the halfway point to TP, simulate
+                    # closing 50% of the position there and moving the SL
+                    # for the remaining 50% to entry — so the trade can no
+                    # longer turn into a full loss after this point.
+                    if not trade.get("partial_closed"):
+                        halfway = entry + (tp - entry) / 2 if sig == "BUY" \
+                                  else entry - (entry - tp) / 2
+                        hit_halfway = False
+                        if sig == "BUY" and max(price, recent_high) >= halfway:
+                            hit_halfway = True
+                        elif sig == "SELL" and min(price, recent_low) <= halfway:
+                            hit_halfway = True
+
+                        if hit_halfway:
+                            partial_pnl = round(
+                                ((halfway - entry) / entry * 100) if sig == "BUY"
+                                else ((entry - halfway) / entry * 100), 3)
+                            trade["partial_closed"]      = True
+                            trade["partial_exit_price"]  = round(halfway, 2)
+                            trade["partial_pnl_pct"]      = partial_pnl
+                            trade["partial_closed_at"]    = now.isoformat()
+                            trade["original_stop_loss"]   = trade.get("original_stop_loss", sl)
+                            trade["sl_at_breakeven"]      = True
+                            trade["stop_loss"] = sl = round(entry, 2)  # SL -> break-even
+                            _db_partial_close_trade(
+                                trade["id"], round(halfway, 2), partial_pnl,
+                                now.isoformat(), round(entry, 2))
+                            changed = True
+                            print(f"[Resolver] {trade['id']} -> PARTIAL TP 50% @ {halfway:.2f}  "
+                                  f"(+{partial_pnl:.3f}%)  SL moved to break-even ${entry:.2f}")
+
                     outcome = exit_price = None
                     if sig == "BUY":
                         # Use candle low to catch sharp drops within the scan window
                         if min(price, recent_low) <= sl:
-                            outcome, exit_price = "LOSS", sl
+                            outcome, exit_price = ("BREAKEVEN" if trade.get("sl_at_breakeven") else "LOSS"), sl
                         elif max(price, recent_high) >= tp:
                             outcome, exit_price = "WIN",  tp
                     elif sig == "SELL":
                         # Use candle high to catch sharp spikes within the scan window
                         if max(price, recent_high) >= sl:
-                            outcome, exit_price = "LOSS", sl
+                            outcome, exit_price = ("BREAKEVEN" if trade.get("sl_at_breakeven") else "LOSS"), sl
                         elif min(price, recent_low) <= tp:
                             outcome, exit_price = "WIN",  tp
 
@@ -2924,11 +3009,21 @@ async def paper_trade_resolver():
                         outcome, exit_price = "EXPIRED", price
 
                     if outcome:
-                        pnl = 0.0
+                        # Final leg PnL — for the remaining 50% if a partial
+                        # close already happened, otherwise the full position
+                        final_leg_pnl = 0.0
                         if entry and exit_price:
-                            pnl = round(
+                            final_leg_pnl = round(
                                 ((exit_price - entry) / entry * 100) if sig == "BUY"
                                 else ((entry - exit_price) / entry * 100), 3)
+
+                        if trade.get("partial_closed"):
+                            # Blend: 50% weight on partial leg + 50% weight on final leg
+                            pnl = round((trade.get("partial_pnl_pct", 0) * 0.5)
+                                        + (final_leg_pnl * 0.5), 3)
+                        else:
+                            pnl = final_leg_pnl
+
                         bars = int(age_hrs * 12)
                         trade.update({
                             "status": "CLOSED", "outcome": outcome,
@@ -2939,7 +3034,8 @@ async def paper_trade_resolver():
                         _db_close_trade(trade["id"], outcome, round(exit_price, 2),
                                         pnl, now.isoformat(), bars)
                         changed = True
-                        print(f"[Resolver] {trade['id']} -> {outcome} @ {exit_price:.2f}  PnL {pnl:+.3f}%")
+                        tag = " (after partial TP)" if trade.get("partial_closed") else ""
+                        print(f"[Resolver] {trade['id']} -> {outcome}{tag} @ {exit_price:.2f}  PnL {pnl:+.3f}%")
                 if changed:
                     _save_json(log_file, log_list)
 
@@ -2959,12 +3055,15 @@ def paper_stats():
     def _analyse(trades, label):
         allowed = [t for t in trades if t.get("trade_allowed") == "YES"
                    and t.get("signal") in ("BUY", "SELL")]
-        closed  = [t for t in allowed if t.get("status") == "CLOSED"]
-        wins    = [t for t in closed  if t.get("outcome") == "WIN"]
-        losses  = [t for t in closed  if t.get("outcome") == "LOSS"]
-        expired = [t for t in closed  if t.get("outcome") == "EXPIRED"]
-        open_   = [t for t in allowed if t.get("status") == "OPEN"]
-        pnls    = [t["pnl_pct"] for t in closed if t.get("pnl_pct") is not None]
+        closed    = [t for t in allowed if t.get("status") == "CLOSED"]
+        wins      = [t for t in closed  if t.get("outcome") == "WIN"]
+        losses    = [t for t in closed  if t.get("outcome") == "LOSS"]
+        breakeven = [t for t in closed  if t.get("outcome") == "BREAKEVEN"]
+        expired   = [t for t in closed  if t.get("outcome") == "EXPIRED"]
+        open_     = [t for t in allowed if t.get("status") == "OPEN"]
+        pnls      = [t["pnl_pct"] for t in closed if t.get("pnl_pct") is not None]
+        partial_hits = [t for t in closed if t.get("partial_closed")]
+        # Win rate counts breakeven separately — it's neither a loss nor a full win
         wr    = round(len(wins) / max(len(wins) + len(losses), 1) * 100, 1)
         avg_w = round(sum(t["pnl_pct"] for t in wins)   / max(len(wins),   1), 3)
         avg_l = round(sum(t["pnl_pct"] for t in losses) / max(len(losses), 1), 3)
@@ -2994,7 +3093,8 @@ def paper_stats():
         return {
             "mode": label, "open_trades": len(open_),
             "total_closed": len(closed), "wins": len(wins),
-            "losses": len(losses), "expired": len(expired),
+            "losses": len(losses), "breakeven": len(breakeven),
+            "expired": len(expired),
             "win_rate": f"{wr}%",
             "total_pnl": f"{round(sum(pnls),3):+.3f}%" if pnls else "+0.000%",
             "avg_pnl_per_trade": f"{round(sum(pnls)/len(pnls),3):+.3f}%" if pnls else "+0.000%",
@@ -3006,6 +3106,12 @@ def paper_stats():
                          "win_rate": f"{round(bw/max(len(buys),1)*100,1)}%"},
                 "SELL": {"total": len(sells), "wins": sw,
                          "win_rate": f"{round(sw/max(len(sells),1)*100,1)}%"},
+            },
+            "partial_tp": {
+                "description": "Trades that hit 50% of TP, took partial profit, "
+                                "and moved SL to break-even for the remaining position",
+                "total_hit_halfway": len(partial_hits),
+                "saved_from_full_loss": len(breakeven),
             },
         }
     sw = _db_get_all_trades(mode="SWING") if (DATABASE_URL and _PG_AVAILABLE) else signal_log
@@ -3131,6 +3237,11 @@ def paper_live_trades(mode: str = "swing", grade: str = None):
             "hours_held":      round(hours_held, 2),
             "logged_at":       t.get("logged_at"),
             "market_regime":   t.get("market_regime"),
+            "partial_closed":      bool(t.get("partial_closed")),
+            "partial_exit_price":  t.get("partial_exit_price"),
+            "partial_pnl_pct":     t.get("partial_pnl_pct"),
+            "sl_at_breakeven":     bool(t.get("sl_at_breakeven")),
+            "original_stop_loss":  t.get("original_stop_loss"),
         })
 
     # Sort by most recently opened first
