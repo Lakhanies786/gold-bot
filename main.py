@@ -295,6 +295,7 @@ _price_cache:  dict = {"price": None, "spread": 0.3, "ts": 0.0}
 CANDLE_CACHE_TTL = 90 if USE_ALLTICK else 600  # 90s with AllTick, 10min with Twelve Data only
 PRICE_CACHE_TTL  = 20 if USE_ALLTICK else 60  # 20s AllTick, 60s Twelve Data only
 PRICE_STALE_TTL  = 180   # seconds — after this, price is dangerously stale
+CANDLE_DANGEROUS_STALE_TTL = 300  # seconds — beyond this, refuse to log signals (was causing 10hr frozen data)
 
 def get_fresh_price() -> tuple:
     """Force fresh price at signal log time for accurate entry price.
@@ -419,7 +420,15 @@ def get_oanda_candles(granularity: str, count: int = 200) -> pd.DataFrame:
     resp = requests.get(f"{TWELVE_DATA_URL}/time_series", params=params, timeout=15)
     if resp.status_code == 429:
         if cached:
-            print(f"[Candles] 429 rate limit for {granularity} — returning stale cache")
+            stale_age = time.time() - cached[1]
+            print(f"[Candles] 429 rate limit for {granularity} — cache is {int(stale_age)}s old")
+            if stale_age > CANDLE_DANGEROUS_STALE_TTL:
+                # Cache too old to trust — refuse to silently serve corrupted data.
+                # This is what was causing hours-long frozen price/volume in logs.
+                raise ValueError(
+                    f"Rate limited and cache for {granularity} is {int(stale_age)}s old "
+                    f"(> {CANDLE_DANGEROUS_STALE_TTL}s limit) — refusing stale data."
+                )
             return cached[0]
         raise ValueError("Rate limited by Twelve Data. Wait 1 minute and retry.")
     resp.raise_for_status()
@@ -565,9 +574,22 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # ATR — critical for gold position sizing
     df["atr"] = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
 
-    # Volume SMA
-    df["vol_sma"]   = vol.rolling(20).mean()
-    df["vol_ratio"] = vol / df["vol_sma"].replace(0, np.nan)
+    # Volume SMA — NOTE: Twelve Data and AllTick both return synthetic/static
+    # volume for XAU/USD (it's an OTC forex/spot instrument with no central
+    # exchange tape, unlike stocks). Relying on it as a real "volume_ratio"
+    # was producing meaningless/stuck values (e.g. 0.08 frozen for 10 hours).
+    # Instead we use a range-based activity proxy: how wide is the current
+    # candle's true range vs its recent average — a real, live-updating
+    # measure of market activity that works for any instrument including gold.
+    true_range = pd.concat([
+        (high - low),
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    df["range_sma"]  = true_range.rolling(20).mean()
+    df["vol_ratio"]  = (true_range / df["range_sma"].replace(0, np.nan)).clip(upper=5.0)
+    # Keep raw volume column too (for display/debug) but it is NOT used for grading
+    df["vol_sma"]    = vol.rolling(20).mean()
 
     # Stochastic
     stoch          = ta.momentum.StochasticOscillator(high, low, close)
@@ -1825,7 +1847,33 @@ def compute_scalp_signal() -> dict:
         confidence = 0
 
     confidence = min(confidence, 95)
-    score_16   = min(round((max(buy_count, sell_count) / 3) * 12), 16)
+
+    # ── Score (0-16) — additive multi-factor, NOT just timeframe count ──
+    # PREVIOUS BUG: score_16 = round((max(buy_count,sell_count)/3)*12) could
+    # ONLY ever equal 8 (2-of-3 agreement) or 12 (3-of-3 agreement) — meaning
+    # Grade A (needs score>=11) was unreachable without unanimous timeframes,
+    # even when confidence/ADX/volume all showed a genuinely strong setup.
+    # Fixed: build score from independent factors like swing scoring does,
+    # so it can land anywhere 0-16 based on real signal quality.
+    agree_count = max(buy_count, sell_count)
+    raw_score = 0
+    # Timeframe agreement (up to 6 pts: 2-of-3=4, 3-of-3=6)
+    if agree_count == 3:   raw_score += 6
+    elif agree_count == 2: raw_score += 4
+    # Trend strength via ADX (up to 4 pts)
+    if adx >= 30:   raw_score += 4
+    elif adx >= 20: raw_score += 2
+    elif adx >= 15: raw_score += 1
+    # Momentum confirmation via 5m MACD magnitude (up to 3 pts)
+    if abs(macd) > 0.5: raw_score += 3
+    elif abs(macd) > 0.2: raw_score += 2
+    elif macd != 0: raw_score += 1
+    # Market activity via range-based vol_ratio (up to 3 pts)
+    if vol_r >= 1.3:   raw_score += 3
+    elif vol_r >= 1.0: raw_score += 2
+    elif vol_r >= 0.7: raw_score += 1
+
+    score_16 = min(raw_score, 16)
 
     final_signal = raw_signal
 
@@ -2973,6 +3021,116 @@ def paper_open_trades():
     else:
         open_trades = [t for t in signal_log + scalp_log if t.get("status") == "OPEN"]
     return {"total": len(open_trades), "trades": open_trades}
+
+
+@app.get("/paper/live")
+def paper_live_trades(mode: str = "swing", grade: str = None):
+    """
+    Live-tracking view for open trades — used by the grade journal drill-down.
+    Returns full detail per trade: live PnL%, distance to SL/TP, time held.
+
+    mode: swing | scalp
+    grade: A | B | C | None (all grades)
+    """
+    try:
+        price, _ = get_current_price()
+    except Exception:
+        price = None
+
+    if DATABASE_URL and _PG_AVAILABLE:
+        all_trades = _db_get_all_trades(mode=mode.upper(), limit=500)
+    else:
+        all_trades = signal_log if mode.lower() == "swing" else scalp_log
+
+    open_trades = [t for t in all_trades
+                   if t.get("status") == "OPEN" and t.get("signal") in ("BUY", "SELL")]
+
+    if grade:
+        open_trades = [t for t in open_trades if t.get("grade") == grade.upper()]
+
+    now = datetime.now(timezone.utc)
+    result = []
+
+    for t in open_trades:
+        entry = t.get("entry_price") or 0
+        sl    = t.get("stop_loss") or 0
+        tp    = t.get("take_profit") or 0
+        sig   = t.get("signal", "")
+
+        # Time held
+        time_held_str = "unknown"
+        hours_held     = 0
+        try:
+            logged_dt  = datetime.fromisoformat(t.get("logged_at", "").replace("Z", "+00:00"))
+            delta      = now - logged_dt
+            hours_held = delta.total_seconds() / 3600
+            if hours_held < 1:
+                time_held_str = f"{int(delta.total_seconds() / 60)}m"
+            else:
+                h = int(hours_held)
+                m = int((hours_held - h) * 60)
+                time_held_str = f"{h}h {m}m"
+        except Exception:
+            pass
+
+        # Live PnL % and distance to SL/TP
+        live_pnl_pct   = None
+        dist_to_sl     = None
+        dist_to_tp     = None
+        floating_state = "unknown"
+
+        if price and entry:
+            if sig == "BUY":
+                live_pnl_pct = round((price - entry) / entry * 100, 3)
+                dist_to_sl   = round(price - sl, 2) if sl else None
+                dist_to_tp   = round(tp - price, 2) if tp else None
+            elif sig == "SELL":
+                live_pnl_pct = round((entry - price) / entry * 100, 3)
+                dist_to_sl   = round(sl - price, 2) if sl else None
+                dist_to_tp   = round(price - tp, 2) if tp else None
+
+            if live_pnl_pct is not None:
+                floating_state = "profit" if live_pnl_pct > 0 else ("loss" if live_pnl_pct < 0 else "breakeven")
+
+        result.append({
+            "id":              t.get("id"),
+            "mode":            t.get("mode"),
+            "grade":           t.get("grade"),
+            "signal":          sig,
+            "confidence":      t.get("confidence"),
+            "session":         t.get("session"),
+            "entry_price":     entry,
+            "current_price":   price,
+            "stop_loss":       sl,
+            "take_profit":     tp,
+            "risk_reward":     t.get("risk_reward"),
+            "sl_method":       t.get("sl_method"),
+            "live_pnl_pct":    f"{live_pnl_pct:+.3f}%" if live_pnl_pct is not None else "--",
+            "floating_state":  floating_state,
+            "dist_to_sl":      dist_to_sl,
+            "dist_to_tp":      dist_to_tp,
+            "time_held":       time_held_str,
+            "hours_held":      round(hours_held, 2),
+            "logged_at":       t.get("logged_at"),
+            "market_regime":   t.get("market_regime"),
+        })
+
+    # Sort by most recently opened first
+    result.sort(key=lambda x: x.get("logged_at", ""), reverse=True)
+
+    wins_floating   = sum(1 for r in result if r["floating_state"] == "profit")
+    losses_floating = sum(1 for r in result if r["floating_state"] == "loss")
+
+    return {
+        "mode":             mode.lower(),
+        "grade_filter":     grade.upper() if grade else "ALL",
+        "current_price":    price,
+        "total_open":       len(result),
+        "currently_winning": wins_floating,
+        "currently_losing":  losses_floating,
+        "trades":           result,
+        "generated_at":     now.isoformat(),
+    }
 
 
 @app.get("/paper/download")
