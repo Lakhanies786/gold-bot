@@ -2370,6 +2370,16 @@ async def background_scanner():
 
     while True:
         try:
+            # ── Skip entire scan when market is closed — saves API quota ──
+            # is_trading_session() costs 0 API calls (pure UTC time check),
+            # so checking it BEFORE fetching candles avoids wasting AllTick/
+            # Twelve Data requests on a day when no real signal can fire.
+            session_check = is_trading_session()
+            if not session_check["in_session"]:
+                print(f"[Scanner] Market closed ({session_check['session']}) — skipping scan, saving API quota")
+                await asyncio.sleep(SCAN_CYCLE_SECONDS)
+                continue
+
             # ── Swing scan ────────────────────────────────────────────
             try:
                 sig    = compute_swing_signal()
@@ -2835,6 +2845,14 @@ async def paper_trade_resolver():
     await asyncio.sleep(180)  # wait 3 min before first resolve
     while True:
         try:
+            # Skip the API-hungry candle fetch entirely if nothing is open —
+            # no point burning AllTick/Twelve Data quota checking trades
+            # that don't exist (e.g. quiet weekend with all trades closed).
+            has_open_trades = any(t.get("status") == "OPEN" for t in signal_log + scalp_log)
+            if not has_open_trades:
+                await asyncio.sleep(SCAN_CYCLE_SECONDS)
+                continue
+
             # Try fresh M1 candles — but don't fail if rate limited
             try:
                 get_oanda_candles("M1", 20)
