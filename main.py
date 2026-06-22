@@ -3303,13 +3303,25 @@ def paper_live_trades(mode: str = "swing", grade: str = None):
     except Exception:
         price = None
 
+    # Always merge DB + in-memory so trades logged before DB was connected
+    # (or during a DB outage) are still visible in the live screen.
     if DATABASE_URL and _PG_AVAILABLE:
-        all_trades = _db_get_all_trades(mode=mode.upper(), limit=500)
+        db_trades = _db_get_all_trades(mode=mode.upper(), limit=500)
+        db_ids    = {t.get("id") for t in db_trades}
+        mem_trades = signal_log if mode.lower() == "swing" else scalp_log
+        # Include in-memory trades that aren't already in the DB result
+        extra = [t for t in mem_trades
+                 if t.get("id") not in db_ids
+                 and t.get("mode", "").upper() == mode.upper()]
+        all_trades = db_trades + extra
     else:
         all_trades = signal_log if mode.lower() == "swing" else scalp_log
 
+    # Match the same filter the grade journal uses — include all BUY/SELL
+    # regardless of trade_allowed so counts stay consistent across screens
     open_trades = [t for t in all_trades
-                   if t.get("status") == "OPEN" and t.get("signal") in ("BUY", "SELL")]
+                   if t.get("status") == "OPEN"
+                   and t.get("signal") in ("BUY", "SELL")]
 
     if grade:
         open_trades = [t for t in open_trades if t.get("grade") == grade.upper()]
